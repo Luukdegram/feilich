@@ -67,7 +67,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
         /// Decodes a 'client hello' message received from the client.
         fn decodeClientHello(self: *Self, message_length: usize) Error!void {
             // maximum length of client hello
-            var buf: [2 + 32 + 32 + (2 ^ 16 - 2) + (2 ^ 8 - 1) + (2 ^ 16 - 1)]u8 = undefined;
+            var buf: [2 + 32 + 32 + (std.math.pow(u32, 2, 16) - 2) + (std.math.pow(u32, 2, 8) - 1) + (std.math.pow(u32, 2, 16) - 1)]u8 = undefined;
             try self.reader.readNoEof(buf[0..message_length]);
             const content = buf[0..message_length];
             // current index into `contents`
@@ -106,10 +106,14 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
             var it: ExtensionIterator = .{ .data = content[index .. index + extensions_length], .index = 0 };
             index += extensions_length;
-            std.debug.assert(index == message_length);
 
-            while (try it.next(self.gpa)) |extension| {
-                _ = extension;
+            loop: while (true) {
+                while (it.next(self.gpa)) |maybe_extension| {
+                    _ = maybe_extension orelse break :loop; // extension == null so stop loop
+                } else |err| switch (err) {
+                    error.UnsupportedExtension => continue :loop,
+                    else => |e| return e,
+                }
             }
         }
 
@@ -168,18 +172,18 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                     // bytes after the 5th element.
                     .server_name => return Extension{ .server_name = extension_data[5..] },
                     .supported_groups => {
-                        var groups = @alignCast(2, std.mem.bytesAsSlice(NamedGroup, extension_data[1..]));
+                        var groups = std.mem.bytesAsSlice(u16, extension_data[2..]);
                         if (target_endianness == .Little) for (groups) |*group| {
-                            group.* = @intToEnum(NamedGroup, @byteSwap(u16, @enumToInt(group.*)));
+                            group.* = @byteSwap(u16, group.*);
                         };
-                        return Extension{ .supported_groups = groups };
+                        return Extension{ .supported_groups = @bitCast([]const NamedGroup, groups) };
                     },
                     .signature_algorithms => {
-                        var algs = @alignCast(2, std.mem.bytesAsSlice(SignatureAlgorithm, extension_data[2..]));
+                        var algs = std.mem.bytesAsSlice(u16, extension_data[2..]);
                         if (target_endianness == .Little) for (algs) |*alg| {
-                            alg.* = @intToEnum(SignatureAlgorithm, @byteSwap(u16, @enumToInt(alg.*)));
+                            alg.* = @byteSwap(u16, alg.*);
                         };
-                        return Extension{ .signature_algorithms = algs };
+                        return Extension{ .signature_algorithms = @bitCast([]const SignatureAlgorithm, algs) };
                     },
                     else => return error.UnsupportedExtension,
                 }
@@ -204,6 +208,9 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             /// TLS uses this to determine which server certificate to use,
             /// rather than requiring multiple servers.
             server_name: []const u8,
+
+            // TODO: Implement the other types. Currently,
+            // they're just void types.
             max_gragment_length,
             status_request,
             use_srtp,
