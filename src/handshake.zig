@@ -117,6 +117,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             }
         }
 
+        /// Constructs extensions as they are parsed.
+        /// Allowing to to reduce the need for allocations.
         const ExtensionIterator = struct {
             /// Mutable slice as we may require
             /// to byteswap elements to ensure correct endianness
@@ -137,7 +139,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                 switch (@intToEnum(Extension.Tag, tag_byte)) {
                     .supported_versions => {
                         const versions = blk: {
-                            var versions = @alignCast(2, std.mem.bytesAsSlice(u16, extension_data[1..]));
+                            var versions = std.mem.bytesAsSlice(u16, extension_data[1..]);
                             if (target_endianness == .Little) for (versions) |*v| {
                                 v.* = @byteSwap(u16, v.*);
                             };
@@ -145,24 +147,32 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                             break :blk versions;
                         };
 
-                        return Extension{ .supported_versions = versions };
+                        return Extension{ .supported_versions = @bitCast([]const u16, versions) };
                     },
                     .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = extension_data[1..] },
                     .key_share => {
-                        const len = extension_data[0];
+                        const len = std.mem.readIntBig(u16, extension_data[0..2]);
                         var keys = std.ArrayList(KeyShare).init(gpa);
                         defer keys.deinit();
 
                         var i: usize = 0;
                         while (i < len) {
-                            const data = extension_data[i + 1 ..];
+                            // allocate memory for a new key
                             const key = try keys.addOne();
-                            i += 2;
+
+                            // get the slice for current data
+                            const data = extension_data[i + 2 ..];
+
+                            // read named_group and the amount of bytes of public key
+                            const named_group = std.mem.readIntBig(u16, data[0..2]);
+                            const key_len = std.mem.readIntBig(u16, data[2..4]);
+
+                            // update pointer's value
                             key.* = .{
-                                .named_group = @intToEnum(NamedGroup, std.mem.readIntBig(u16, data[0..2])),
-                                .key_exchange = data[2..],
+                                .named_group = @intToEnum(NamedGroup, named_group),
+                                .key_exchange = data[4..][0..key_len],
                             };
-                            i += key.key_exchange.len;
+                            i += key_len + 4;
                         }
 
                         return Extension{ .key_share = keys.toOwnedSlice() };
@@ -345,7 +355,7 @@ test "Client Hello" {
         0x01, 0x00,
         // Extension length
         0x00, 0x77,
-           // Extension - Server name
+        // Extension - Server name
         0x00, 0x00, 0x00, 0x18, 0x00, 0x16, 0x00, 0x00,
         0x13, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
         0x2e, 0x75, 0x6c, 0x66, 0x68, 0x65, 0x69, 0x6d,
