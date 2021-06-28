@@ -21,7 +21,7 @@ pub const HandshakeType = enum(u8) {
     message_hash = 254,
 };
 
-pub const DecodeError = error{
+pub const ReadError = error{
     /// For TLS 1.3, the legacy version must be 0x0303 (TLS 1.2)
     MismatchingLegacyVersion,
     /// Reached end of stream, perhaps the client disconnected.
@@ -45,7 +45,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
         /// Allocater used to construct our data
         gpa: *Allocator,
 
-        pub const Error = DecodeError || ReaderType.Error || Allocator.Error;
+        pub const Error = ReadError || ReaderType.Error || Allocator.Error;
 
         /// Initializes a new instance of `HandshakeReader` of a given reader that must be of
         /// `ReaderType`.
@@ -385,3 +385,76 @@ test "Client Hello" {
     var hs_reader = handshakeReader(std.testing.allocator, fb_reader);
     try hs_reader.decode();
 }
+
+/// Initializes a new `HandshakeWriter`, deducing the type of a given
+/// instance of a `writer`. The handshake writer will construct all
+/// required messages for a succesful handshake.
+pub fn handshakeWriter(writer: anytype) HandshakeWriter(@TypeOf(writer)) {
+    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer);
+}
+
+/// Creates a new HandshakeWriter using a given writer type.
+/// The handshakewriter builds all messages required to construct a succesful handshake.
+pub fn HandshakeWriter(comptime WriterType: type) type {
+    return struct{
+        const Self = @This();
+
+        writer: WriterType,
+
+        const Error = WriteError || WriterType.Error;
+
+        /// Constructs and sends a 'Server Hello' message to the client.
+        /// This must be called, after a succesful 'Client Hello' message was received.
+        pub fn serverHello(self: *writer) Error!void {
+            _ = self;
+        }
+    };
+}
+
+//TODO: Move this to where we will handle all transactions, as
+//it's not really part of handshake itself.
+/// Record header. TLS sessions are broken into the sending
+/// and receiving of records, which are blocks of data with a type,
+/// protocol version and a length.
+pub const Record = extern struct {
+    /// The type of record we're receiving or sending
+    record_type: RecordType,
+    /// The (legacy) protocol version.
+    /// This is *always* 0x0303 (TLS 1.2) even for TLS 1.3
+    /// as the supported versions are part of an extension in TLS 1.3,
+    /// rather than the `Record` header.
+    protocol_version: u16 = 0x0303,
+    /// The length of the bytes that are left for reading.
+    /// The length MUST not exceed 2^14 bytes.
+    len: u16,
+
+    /// Supported record types by TLS 1.3
+    pub const RecordType = enum(u8) {
+        change_cipher_spec = 20,
+        alert = 21,
+        handshake = 22,
+        application_data = 23,
+    };
+
+    /// Initializes a new `Record` that always has its `protocol_version` set to 0x0303.
+    pub fn init(record_type: RecordType, len: usize) Record {
+        return .{.record_type = record_type, .len = len};
+    }
+
+    /// Writes a `Record` to a given `writer`.
+    pub fn write(self: Record, writer: anytype) !void {
+        try writer.writeByte(@enumToInt(self.record_type));
+        try writer.writeIntBig(u16, self.protocol_version);
+        try writer.writeIntBig(u16, self.len);
+    }
+
+    /// Reads from a given `reader` to initialize a new `Record`.
+    /// It's up to the user to verify correctness of the data (such as protocol version).
+    pub fn read(reader: anytype) !Record {
+        return Record{
+            .record_type = @intToEnum(RecordType, try reader.readByte()),
+            .protocol_version = try reader.readIntBig(u16),
+            .len = try reader.readIntBig(u16),
+        };
+    }
+};
