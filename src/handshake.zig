@@ -1,7 +1,9 @@
 //! Contains the data and logic to perform
 //! a TLS 1.3 handshake
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+const tls = @import("tls.zig");
+const Allocator = mem.Allocator;
+const mem = std.mem;
 
 /// Target cpu's endianness. Use this to check if byte swapping is required.
 const target_endianness = std.builtin.target.cpu.arch.endian();
@@ -66,45 +68,51 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
         /// Decodes a 'client hello' message received from the client.
         fn decodeClientHello(self: *Self, message_length: usize) Error!void {
-            // maximum length of client hello
-            var buf: [2 + 32 + 32 + (std.math.pow(u32, 2, 16) - 2) + (std.math.pow(u32, 2, 8) - 1) + (std.math.pow(u32, 2, 16) - 1)]u8 = undefined;
+            // maximum length of an entire record (record header + message)
+            var buf: [1 << 14]u8 = undefined;
             try self.reader.readNoEof(buf[0..message_length]);
             const content = buf[0..message_length];
             // current index into `contents`
-            if (std.mem.readIntBig(u16, content[0..2]) != 0x0303) return error.MismatchingLegacyVersion;
+            if (mem.readIntBig(u16, content[0..2]) != 0x0303) return error.MismatchingLegacyVersion;
             var index: usize = 2;
 
             const random = content[index..34];
             _ = random; // TODO, check this
-            index += 32;
+            index += 32; // random
 
+            // TLS version 1.3 ignores session_id
+            // but we will return it to echo it in the server hello.
             const session_len = content[index];
+            index += 1;
             if (session_len != 0) {
-                index += 1;
-                const session_id = content[index .. index + 32];
-                index += 32;
-                // TLS version 1.3 ignores session_id
-                _ = session_id;
+                const session_id = content[index..][0..32];
+                index += session_id.len;
             }
 
-            const cipher_suites_len = std.mem.readIntBig(u16, content[index..][0..2]);
+            const cipher_suites_len = mem.readIntBig(u16, content[index..][0..2]);
             index += 2;
-            const cipher_suites = content[index .. index + cipher_suites_len];
-            _ = cipher_suites; //TODO, check this
-            index += cipher_suites_len;
 
-            const compression_methods_len = content[index];
-            index += 1;
-            const compression_methods = content[index .. index + compression_methods_len];
-            index += compression_methods_len;
+            const cipher_suites = blk: {
+                const cipher_bytes = content[index..][0..cipher_suites_len];
+                index += cipher_suites_len;
+                var ciphers = mem.bytesAsSlice(u16, cipher_bytes);
+                if (target_endianness == .Little) for (ciphers) |*cipher| {
+                    cipher.* = @byteSwap(u16, cipher.*);
+                };
+                break :blk @bitCast([]const tls.CipherSuite, ciphers);
+            };
+            _ = cipher_suites;
 
             // TLS version 1.3 ignores compression as well
-            _ = compression_methods;
+            const compression_methods_len = content[index];
+            index += compression_methods_len + 1;
 
-            const extensions_length = std.mem.readIntBig(u16, content[index..][0..2]);
+            const extensions_length = mem.readIntBig(u16, content[index..][0..2]);
             index += 2;
-
-            var it: ExtensionIterator = .{ .data = content[index .. index + extensions_length], .index = 0 };
+            var it: ExtensionIterator = .{
+                .data = content[index..][0..extensions_length],
+                .index = 0,
+            };
             index += extensions_length;
 
             loop: while (true) {
@@ -115,6 +123,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                     else => |e| return e,
                 }
             }
+
+            std.debug.assert(index == message_length);
         }
 
         /// Constructs extensions as they are parsed.
@@ -126,12 +136,15 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             /// Current index into `data`
             index: usize,
 
+            /// Parses the next extension, returning `null` when all extensions have been parsed.
+            /// Will return `UnsupportedExtension` when an extension is not supported by TLS 1.3,
+            /// or simply isn't implemented yet.
             fn next(self: *ExtensionIterator, gpa: *Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
                 if (self.index >= self.data.len) return null;
 
-                const tag_byte = std.mem.readIntBig(u16, self.data[self.index..][0..2]);
+                const tag_byte = mem.readIntBig(u16, self.data[self.index..][0..2]);
                 self.index += 2;
-                const extension_length = std.mem.readIntBig(u16, self.data[self.index..][0..2]);
+                const extension_length = mem.readIntBig(u16, self.data[self.index..][0..2]);
                 self.index += 2;
                 const extension_data = self.data[self.index .. self.index + extension_length];
                 self.index += extension_data.len;
@@ -139,7 +152,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                 switch (@intToEnum(Extension.Tag, tag_byte)) {
                     .supported_versions => {
                         const versions = blk: {
-                            var versions = std.mem.bytesAsSlice(u16, extension_data[1..]);
+                            var versions = mem.bytesAsSlice(u16, extension_data[1..]);
                             if (target_endianness == .Little) for (versions) |*v| {
                                 v.* = @byteSwap(u16, v.*);
                             };
@@ -151,8 +164,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                     },
                     .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = extension_data[1..] },
                     .key_share => {
-                        const len = std.mem.readIntBig(u16, extension_data[0..2]);
-                        var keys = std.ArrayList(KeyShare).init(gpa);
+                        const len = mem.readIntBig(u16, extension_data[0..2]);
+                        var keys = std.ArrayList(tls.KeyShare).init(gpa);
                         defer keys.deinit();
 
                         var i: usize = 0;
@@ -164,12 +177,12 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                             const data = extension_data[i + 2 ..];
 
                             // read named_group and the amount of bytes of public key
-                            const named_group = std.mem.readIntBig(u16, data[0..2]);
-                            const key_len = std.mem.readIntBig(u16, data[2..4]);
+                            const named_group = mem.readIntBig(u16, data[0..2]);
+                            const key_len = mem.readIntBig(u16, data[2..4]);
 
                             // update pointer's value
                             key.* = .{
-                                .named_group = @intToEnum(NamedGroup, named_group),
+                                .named_group = @intToEnum(tls.NamedGroup, named_group),
                                 .key_exchange = data[4..][0..key_len],
                             };
                             i += key_len + 4;
@@ -182,151 +195,173 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
                     // bytes after the 5th element.
                     .server_name => return Extension{ .server_name = extension_data[5..] },
                     .supported_groups => {
-                        var groups = std.mem.bytesAsSlice(u16, extension_data[2..]);
+                        var groups = mem.bytesAsSlice(u16, extension_data[2..]);
                         if (target_endianness == .Little) for (groups) |*group| {
                             group.* = @byteSwap(u16, group.*);
                         };
-                        return Extension{ .supported_groups = @bitCast([]const NamedGroup, groups) };
+                        return Extension{ .supported_groups = @bitCast([]const tls.NamedGroup, groups) };
                     },
                     .signature_algorithms => {
-                        var algs = std.mem.bytesAsSlice(u16, extension_data[2..]);
+                        var algs = mem.bytesAsSlice(u16, extension_data[2..]);
                         if (target_endianness == .Little) for (algs) |*alg| {
                             alg.* = @byteSwap(u16, alg.*);
                         };
-                        return Extension{ .signature_algorithms = @bitCast([]const SignatureAlgorithm, algs) };
+                        return Extension{ .signature_algorithms = @bitCast([]const tls.SignatureAlgorithm, algs) };
                     },
                     else => return error.UnsupportedExtension,
                 }
             }
         };
-
-        /// Extension define what the client requests for extended functionality from servers.
-        /// Note that some extensions are required for TLS 1.3 itself,
-        /// while others are optional.
-        const Extension = union(Tag) {
-            /// The supported TLS versions of the client.
-            supported_versions: []const u16,
-            /// The PSK key exchange modes the client supports
-            psk_key_exchange_modes: []const u8,
-            /// List of public keys and the key exchange required for them.
-            key_share: []const KeyShare,
-            /// A list of signature algorithms the client supports
-            signature_algorithms: []const SignatureAlgorithm,
-            /// The groups of curve types the client supports
-            supported_groups: []const NamedGroup,
-            /// Hostname of the server the client wants to connect to
-            /// TLS uses this to determine which server certificate to use,
-            /// rather than requiring multiple servers.
-            server_name: []const u8,
-
-            // TODO: Implement the other types. Currently,
-            // they're just void types.
-            max_gragment_length,
-            status_request,
-            use_srtp,
-            heartbeat,
-            application_layer_protocol_negotation,
-            signed_certificate_timestamp,
-            client_certificate_type,
-            server_certificate_type,
-            pre_shared_key,
-            early_data,
-            cookie,
-            certificate_authorities,
-            oid_filters,
-            post_handshake_auth,
-            signature_algorithms_cert,
-
-            /// All extensions that are compatible with TLS 1.3
-            /// Some may be specified as an external rfc.
-            const Tag = enum(u16) {
-                server_name = 0,
-                max_gragment_length = 1,
-                status_request = 5,
-                supported_groups = 10,
-                signature_algorithms = 13,
-                use_srtp = 14,
-                heartbeat = 15,
-                application_layer_protocol_negotation = 16,
-                signed_certificate_timestamp = 18,
-                client_certificate_type = 19,
-                server_certificate_type = 20,
-                pre_shared_key = 41,
-                early_data = 42,
-                supported_versions = 43,
-                cookie = 44,
-                psk_key_exchange_modes = 45,
-                certificate_authorities = 47,
-                oid_filters = 48,
-                post_handshake_auth = 49,
-                signature_algorithms_cert = 50,
-                key_share = 51,
-            };
-        };
     };
 }
 
-/// Represents the key exchange that is supported by the client or server
-/// Prior to TLS 1.3 this was called 'elliptic_curves' and only contained elliptic curve groups.
-const NamedGroup = enum(u16) {
-    secp256r1 = 0x0017,
-    secp384r1 = 0x0018,
-    secp521r1 = 0x0019,
-    x25519 = 0x001D,
-    x448 = 0x001E,
-    ffdhe2048 = 0x0100,
-    ffdhe3072 = 0x0101,
-    ffdhe4096 = 0x0102,
-    ffdhe_private_use_start = 0x01FC,
-    ffdhe_private_use_end = 0x01FF,
-    ecdhe_private_use_start = 0xFE00,
-    ecdhe_private_use_end = 0xFEFF,
-    /// reserved and unsupported values
-    /// as they're part of earlier TLS version.
-    _,
+/// Extension define what the client requests for extended functionality from servers.
+/// Note that some extensions are required for TLS 1.3 itself,
+/// while others are optional.
+const Extension = union(Tag) {
+    /// The supported TLS versions of the client.
+    supported_versions: []const u16,
+    /// The PSK key exchange modes the client supports
+    psk_key_exchange_modes: []const u8,
+    /// List of public keys and the key exchange required for them.
+    key_share: []const tls.KeyShare,
+    /// A list of signature algorithms the client supports
+    signature_algorithms: []const tls.SignatureAlgorithm,
+    /// The groups of curve types the client supports
+    supported_groups: []const tls.NamedGroup,
+    /// Hostname of the server the client wants to connect to
+    /// TLS uses this to determine which server certificate to use,
+    /// rather than requiring multiple servers.
+    server_name: []const u8,
+
+    // TODO: Implement the other types. Currently,
+    // they're just void types.
+    max_gragment_length,
+    status_request,
+    use_srtp,
+    heartbeat,
+    application_layer_protocol_negotation,
+    signed_certificate_timestamp,
+    client_certificate_type,
+    server_certificate_type,
+    pre_shared_key,
+    early_data,
+    cookie,
+    certificate_authorities,
+    oid_filters,
+    post_handshake_auth,
+    signature_algorithms_cert,
+
+    /// All extensions that are compatible with TLS 1.3
+    /// Some may be specified as an external rfc.
+    const Tag = enum(u16) {
+        server_name = 0,
+        max_gragment_length = 1,
+        status_request = 5,
+        supported_groups = 10,
+        signature_algorithms = 13,
+        use_srtp = 14,
+        heartbeat = 15,
+        application_layer_protocol_negotation = 16,
+        signed_certificate_timestamp = 18,
+        client_certificate_type = 19,
+        server_certificate_type = 20,
+        pre_shared_key = 41,
+        early_data = 42,
+        supported_versions = 43,
+        cookie = 44,
+        psk_key_exchange_modes = 45,
+        certificate_authorities = 47,
+        oid_filters = 48,
+        post_handshake_auth = 49,
+        signature_algorithms_cert = 50,
+        key_share = 51,
+
+        fn int(self: Tag) u16 {
+            return @enumToInt(self);
+        }
+    };
 };
 
-const SignatureAlgorithm = enum(u16) {
-    // RSASSA-PKCS1-v1_5 algorithms
-    rsa_pkcs1_sha256 = 0x0401,
-    rsa_pkcs1_sha384 = 0x0501,
-    rsa_pkcs1_sha512 = 0x0601,
+/// Initializes a new `HandshakeWriter`, deducing the type of a given
+/// instance of a `writer`. The handshake writer will construct all
+/// required messages for a succesful handshake.
+pub fn handshakeWriter(writer: anytype) HandshakeWriter(@TypeOf(writer)) {
+    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer);
+}
 
-    // ECDSA algorithms
-    ecdsa_secp256r1_sha256 = 0x0403,
-    ecdsa_secp384r1_sha384 = 0x0503,
-    ecdsa_secp521r1_sha512 = 0x0603,
+/// Creates a new HandshakeWriter using a given writer type.
+/// The handshakewriter builds all messages required to construct a succesful handshake.
+pub fn HandshakeWriter(comptime WriterType: type) type {
+    return struct {
+        const Self = @This();
 
-    // RSASSA-PSS algorithms with public key OID rsaEncryption
-    rsa_pss_rsae_sha256 = 0x0804,
-    rsa_pss_rsae_sha384 = 0x0805,
-    rsa_pss_rsae_sha512 = 0x0806,
+        writer: WriterType,
 
-    // EdDSA algorithms
-    ed25519 = 0x0807,
-    ed448 = 0x0808,
+        const Error = WriteError || WriterType.Error;
 
-    // RSASSA-PSS algorithms with public key OID RSASSA-PSS
-    rsa_pss_pss_sha256 = 0x0809,
-    rsa_pss_pss_sha384 = 0x080a,
-    rsa_pss_pss_sha512 = 0x080b,
+        /// Constructs and sends a 'Server Hello' message to the client.
+        /// This must be called, after a succesful 'Client Hello' message was received.
+        pub fn serverHello(
+            self: *Self,
+            // Legacy session_id to emit.
+            // In TLS 1.3 we can simply echo client's session id.
+            session_id: [32]u8,
+            // The cipher_suite we support as a server and that was provided
+            // by the client.
+            cipher_suite: tls.CipherSuite,
+            /// The `KeyShare` that was generated, based
+            /// on the client's Key Share.
+            key_share: tls.KeyShare,
+        ) Error!void {
+            try self.writer.writeByte(@enumToInt(HandshakeType.server_hello));
 
-    // Legacy algorithms
-    rsa_pkcs1_sha1 = 0x0201,
-    ecdsa_sha1 = 0x0203,
+            // The total amount of bytes the client must read to decode the
+            // entire 'server hello' message.
+            const total_length: u16 = 118;
+            try self.writer.writeIntBig(u16, total_length);
 
-    /// Reserved Code Points
-    _,
-};
+            // Means TLS 1.2, this is legacy and actual version is sent through extensions
+            try self.writer.writeIntBig(u16, 0x303);
 
-/// Keyshare represents the key exchange used to generate
-/// its public key, and the actual public key.
-const KeyShare = struct {
-    /// The key exchange (i.e. curve25519)
-    named_group: NamedGroup,
-    /// The public key of the client
-    key_exchange: []const u8,
-};
+            const server_random = blk: {
+                var seed: [32]u8 = undefined;
+                std.crypto.random.bytes(&seed);
+                break :blk;
+            };
+            try self.writer.writeAll(server_random);
+
+            // session_id is legacy and no longer used. In TLS 1.3 we
+            // can just 'echo' client's session id.
+            try self.writer.writeAll(session_id);
+
+            // cipher suite
+            try self.writer.writeIntBig(u16, cipher_suite.int());
+
+            // Compression methods, which is no longer allowed for TLS 1.3 so assign "null"
+            const compression_methods = &[_]u8{ 0x1, 0x00 };
+            try self.writer.writeAll(compression_methods);
+
+            // write the extension length (46 bytes)
+            try self.writer.writeIntBig(u16, 0x002E);
+            total_data += 2;
+
+            // Extension -- Key Share
+            try key_share.write(self.writer);
+
+            // Extension -- Supported versions
+            const supported_versions = &[_]u8{
+                // Extension type
+                0x0,  0x2b,
+                // byte length (2) remaining
+                0x0,  0x02,
+                // actual version (TLS 1.3)
+                0x03, 0x04,
+            };
+            try self.writer.writeAll(supported_versions);
+        }
+    };
+}
 
 test "Client Hello" {
     // Client hello bytes taken from:
@@ -379,34 +414,9 @@ test "Client Hello" {
         // Extension - Supported versions
         0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04,
     };
-    // zig-fmt: on
+    // zig fmt: on
 
     var fb_reader = std.io.fixedBufferStream(&data).reader();
     var hs_reader = handshakeReader(std.testing.allocator, fb_reader);
     try hs_reader.decode();
-}
-
-/// Initializes a new `HandshakeWriter`, deducing the type of a given
-/// instance of a `writer`. The handshake writer will construct all
-/// required messages for a succesful handshake.
-pub fn handshakeWriter(writer: anytype) HandshakeWriter(@TypeOf(writer)) {
-    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer);
-}
-
-/// Creates a new HandshakeWriter using a given writer type.
-/// The handshakewriter builds all messages required to construct a succesful handshake.
-pub fn HandshakeWriter(comptime WriterType: type) type {
-    return struct{
-        const Self = @This();
-
-        writer: WriterType,
-
-        const Error = WriteError || WriterType.Error;
-
-        /// Constructs and sends a 'Server Hello' message to the client.
-        /// This must be called, after a succesful 'Client Hello' message was received.
-        pub fn serverHello(self: *writer) Error!void {
-            _ = self;
-        }
-    };
 }
