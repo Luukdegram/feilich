@@ -2,7 +2,6 @@
 //! a TLS 1.3 handshake
 const std = @import("std");
 const tls = @import("tls.zig");
-const Allocator = mem.Allocator;
 const mem = std.mem;
 
 /// Represents the possible handshake types
@@ -18,6 +17,10 @@ pub const HandshakeType = enum(u8) {
     finished = 20,
     key_update = 24,
     message_hash = 254,
+
+    pub fn int(self: HandshakeType) u8 {
+        return @enumToInt(self);
+    }
 };
 
 pub const ReadError = error{
@@ -26,8 +29,8 @@ pub const ReadError = error{
 };
 
 /// Initializes a new reader that decodes and performs a handshake
-pub fn handshakeReader(gpa: *Allocator, reader: anytype) HandshakeReader(@TypeOf(reader)) {
-    return HandshakeReader(@TypeOf(reader)).init(gpa, reader);
+pub fn handshakeReader(reader: anytype) HandshakeReader(@TypeOf(reader)) {
+    return HandshakeReader(@TypeOf(reader)).init(reader);
 }
 
 /// Generic handshake reader that will perform a handshake and decode all
@@ -37,10 +40,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
         const Self = @This();
         /// Reader we're reading from
         reader: ReaderType,
-        /// Allocater used to construct our data
-        gpa: *Allocator,
 
-        pub const Error = ReadError || ReaderType.Error || Allocator.Error;
+        pub const Error = ReadError || ReaderType.Error;
 
         const ClientHelloResult = struct {
             legacy_version: u16,
@@ -58,8 +59,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
         /// Initializes a new instance of `HandshakeReader` of a given reader that must be of
         /// `ReaderType`.
-        pub fn init(gpa: *Allocator, reader: ReaderType) Self {
-            return .{ .gpa = gpa, .reader = reader };
+        pub fn init(reader: ReaderType) Self {
+            return .{ .reader = reader };
         }
 
         /// Starts reading from the reader and will try to perform a handshake.
@@ -94,11 +95,10 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             // but we will return it to echo it in the server hello.
             const session_len = content[index];
             index += 1;
+            result.session_id = [_]u8{0} ** 32;
             if (session_len != 0) {
-                std.mem.copy(u8, &result.session_id, content[index..][0..32]);
+                std.mem.copy(u8, &result.session_id, content[index..][0..session_len]);
                 index += session_len;
-            } else {
-                result.session_id = [_]u8{0} ** 32;
             }
 
             const cipher_suites_len = mem.readIntBig(u16, content[index..][0..2]);
@@ -148,6 +148,11 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
         /// This must be called, after a succesful 'Client Hello' message was received.
         pub fn serverHello(
             self: *Self,
+            /// Determines if the server hello is a regular server hello,
+            /// or a Hello Retry Request. As the messages share the same format,
+            /// they're combined for simplicity, but the random that is generated
+            /// will be different.
+            kind: enum { server_hello, retry_request },
             // Legacy session_id to emit.
             // In TLS 1.3 we can simply echo client's session id.
             session_id: [32]u8,
@@ -158,20 +163,33 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             /// on the client's Key Share.
             key_share: tls.KeyShare,
         ) Error!void {
-            try self.writer.writeByte(@enumToInt(HandshakeType.server_hello));
+            try self.writer.writeByte(HandshakeType.server_hello.int());
 
             // The total amount of bytes the client must read to decode the
             // entire 'server hello' message.
-            const total_length: u16 = 118;
-            try self.writer.writeIntBig(u16, total_length);
+            // TODO: byteLen returns the full length, but when `kind` is `retry_request`
+            // we will only send the `named_group`, and not the key exchange.
+            try self.writer.writeIntBig(u16, 76 + key_share.byteLen());
 
             // Means TLS 1.2, this is legacy and actual version is sent through extensions
             try self.writer.writeIntBig(u16, 0x303);
 
-            const server_random = blk: {
-                var seed: [32]u8 = undefined;
-                std.crypto.random.bytes(&seed);
-                break :blk;
+            const server_random = switch (kind) {
+                .server_hello => blk: {
+                    // we do not provide TLS downgrading and therefore do not have to set the
+                    // last 8 bytes to specific values as noted in section 4.1.3
+                    // https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
+                    var seed: [32]u8 = undefined;
+                    std.crypto.random.bytes(&seed);
+                    break :blk;
+                },
+                .retry_request => blk: {
+                    // When sending a hello retry request, the random must always be the
+                    // SHA-256 of "HelloRetryRequest"
+                    var random: [u32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash("HelloRetryRequest", &random, .{});
+                    break :blk random;
+                },
             };
             try self.writer.writeAll(server_random);
 
@@ -191,13 +209,14 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             total_data += 2;
 
             // Extension -- Key Share
-            try key_share.write(self.writer);
+            // TODO: When sending a retry, we should only send the named_group we want.
+            try key_share.writeTo(self.writer);
 
             // Extension -- Supported versions
             const supported_versions = &[_]u8{
                 // Extension type
                 0x0,  0x2b,
-                // byte length (2) remaining
+                // byte length remaining (2)
                 0x0,  0x02,
                 // actual version (TLS 1.3)
                 0x03, 0x04,
@@ -262,7 +281,7 @@ test "Client Hello" {
     // zig fmt: on
 
     var fb_reader = std.io.fixedBufferStream(&data).reader();
-    var hs_reader = handshakeReader(std.testing.allocator, fb_reader);
+    var hs_reader = handshakeReader(fb_reader);
     const result = try hs_reader.decode();
     const client_hello = result.client_hello;
 

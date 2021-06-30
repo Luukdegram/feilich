@@ -35,7 +35,7 @@ pub const Record = extern struct {
     }
 
     /// Writes a `Record` to a given `writer`.
-    pub fn write(self: Record, writer: anytype) !void {
+    pub fn writeTo(self: Record, writer: anytype) !void {
         try writer.writeByte(@enumToInt(self.record_type));
         try writer.writeIntBig(u16, self.protocol_version);
         try writer.writeIntBig(u16, self.len);
@@ -43,7 +43,7 @@ pub const Record = extern struct {
 
     /// Reads from a given `reader` to initialize a new `Record`.
     /// It's up to the user to verify correctness of the data (such as protocol version).
-    pub fn read(reader: anytype) !Record {
+    pub fn readFrom(reader: anytype) !Record {
         return Record{
             .record_type = @intToEnum(RecordType, try reader.readByte()),
             .protocol_version = try reader.readIntBig(u16),
@@ -149,9 +149,15 @@ pub const KeyShare = struct {
     /// The public key of the client
     key_exchange: []const u8,
 
+    /// Returns the total bytes it will write to a TLS connection
+    /// during a handshake
+    pub fn byteLen(self: KeyShare) u16 {
+        return self.key_exchange.len + 8;
+    }
+
     /// Ensures the correct bytes are written to the writer
     /// based on a given `KeyShare`.
-    fn write(self: KeyShare, writer: anytype) !void {
+    pub fn writeTo(self: KeyShare, writer: anytype) !void {
         try writer.writeIntBig(u16, Extension.Tag.key_share.int());
         try writer.writeIntBig(u16, 0x0024); // length (36 bytes)
         try writer.writeIntBig(u16, self.named_group.int());
