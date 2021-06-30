@@ -5,9 +5,6 @@ const tls = @import("tls.zig");
 const Allocator = mem.Allocator;
 const mem = std.mem;
 
-/// Target cpu's endianness. Use this to check if byte swapping is required.
-const target_endianness = std.builtin.target.cpu.arch.endian();
-
 /// Represents the possible handshake types
 pub const HandshakeType = enum(u8) {
     client_hello = 1,
@@ -24,12 +21,8 @@ pub const HandshakeType = enum(u8) {
 };
 
 pub const ReadError = error{
-    /// For TLS 1.3, the legacy version must be 0x0303 (TLS 1.2)
-    MismatchingLegacyVersion,
     /// Reached end of stream, perhaps the client disconnected.
     EndOfStream,
-    /// The client requested for an extension the server does not support.
-    UnsupportedExtension,
 };
 
 /// Initializes a new reader that decodes and performs a handshake
@@ -49,6 +42,20 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
         pub const Error = ReadError || ReaderType.Error || Allocator.Error;
 
+        const ClientHelloResult = struct {
+            legacy_version: u16,
+            session_id: [32]u8,
+            random: [32]u8,
+            cipher_suites: []const tls.CipherSuite,
+            /// Represents the extensions as raw bytes
+            /// Utilize ExtensionIterator to iterate over.
+            extensions: []const u8,
+        };
+
+        const Result = union(enum) {
+            client_hello: ClientHelloResult,
+        };
+
         /// Initializes a new instance of `HandshakeReader` of a given reader that must be of
         /// `ReaderType`.
         pub fn init(gpa: *Allocator, reader: ReaderType) Self {
@@ -56,28 +63,31 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
         }
 
         /// Starts reading from the reader and will try to perform a handshake.
-        pub fn decode(self: *Self) Error!void {
+        pub fn decode(self: *Self) Error!Result {
             const handshake_type = try self.reader.readByte();
             const remaining_length = try self.reader.readIntBig(u24);
 
             switch (@intToEnum(HandshakeType, handshake_type)) {
-                .client_hello => try self.decodeClientHello(remaining_length),
+                .client_hello => return Result{ .client_hello = try self.decodeClientHello(remaining_length) },
                 else => @panic("TODO"),
             }
         }
 
         /// Decodes a 'client hello' message received from the client.
-        fn decodeClientHello(self: *Self, message_length: usize) Error!void {
+        /// This means the Record header and handshake header have already been read
+        /// and the first data to read will be the protocol version.
+        pub fn decodeClientHello(self: *Self, message_length: usize) Error!ClientHelloResult {
+            var result: ClientHelloResult = undefined;
+
             // maximum length of an entire record (record header + message)
             var buf: [1 << 14]u8 = undefined;
             try self.reader.readNoEof(buf[0..message_length]);
             const content = buf[0..message_length];
+            result.legacy_version = mem.readIntBig(u16, content[0..2]);
             // current index into `contents`
-            if (mem.readIntBig(u16, content[0..2]) != 0x0303) return error.MismatchingLegacyVersion;
             var index: usize = 2;
 
-            const random = content[index..34];
-            _ = random; // TODO, check this
+            std.mem.copy(u8, &result.random, content[index..][0..32]);
             index += 32; // random
 
             // TLS version 1.3 ignores session_id
@@ -85,8 +95,10 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             const session_len = content[index];
             index += 1;
             if (session_len != 0) {
-                const session_id = content[index..][0..32];
-                index += session_id.len;
+                std.mem.copy(u8, &result.session_id, content[index..][0..32]);
+                index += session_len;
+            } else {
+                result.session_id = [_]u8{0} ** 32;
             }
 
             const cipher_suites_len = mem.readIntBig(u16, content[index..][0..2]);
@@ -95,13 +107,9 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             const cipher_suites = blk: {
                 const cipher_bytes = content[index..][0..cipher_suites_len];
                 index += cipher_suites_len;
-                var ciphers = mem.bytesAsSlice(u16, cipher_bytes);
-                if (target_endianness == .Little) for (ciphers) |*cipher| {
-                    cipher.* = @byteSwap(u16, cipher.*);
-                };
-                break :blk @bitCast([]const tls.CipherSuite, ciphers);
+                break :blk tls.bytesToTypedSlice(tls.CipherSuite, cipher_bytes);
             };
-            _ = cipher_suites;
+            result.cipher_suites = cipher_suites;
 
             // TLS version 1.3 ignores compression as well
             const compression_methods_len = content[index];
@@ -109,179 +117,15 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
             const extensions_length = mem.readIntBig(u16, content[index..][0..2]);
             index += 2;
-            var it: ExtensionIterator = .{
-                .data = content[index..][0..extensions_length],
-                .index = 0,
-            };
+            result.extensions = content[index..][0..extensions_length];
             index += extensions_length;
 
-            loop: while (true) {
-                while (it.next(self.gpa)) |maybe_extension| {
-                    _ = maybe_extension orelse break :loop; // extension == null so stop loop
-                } else |err| switch (err) {
-                    error.UnsupportedExtension => continue :loop,
-                    else => |e| return e,
-                }
-            }
-
             std.debug.assert(index == message_length);
+
+            return result;
         }
-
-        /// Constructs extensions as they are parsed.
-        /// Allowing to to reduce the need for allocations.
-        const ExtensionIterator = struct {
-            /// Mutable slice as we may require
-            /// to byteswap elements to ensure correct endianness
-            data: []u8,
-            /// Current index into `data`
-            index: usize,
-
-            /// Parses the next extension, returning `null` when all extensions have been parsed.
-            /// Will return `UnsupportedExtension` when an extension is not supported by TLS 1.3,
-            /// or simply isn't implemented yet.
-            fn next(self: *ExtensionIterator, gpa: *Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
-                if (self.index >= self.data.len) return null;
-
-                const tag_byte = mem.readIntBig(u16, self.data[self.index..][0..2]);
-                self.index += 2;
-                const extension_length = mem.readIntBig(u16, self.data[self.index..][0..2]);
-                self.index += 2;
-                const extension_data = self.data[self.index .. self.index + extension_length];
-                self.index += extension_data.len;
-
-                switch (@intToEnum(Extension.Tag, tag_byte)) {
-                    .supported_versions => {
-                        const versions = blk: {
-                            var versions = mem.bytesAsSlice(u16, extension_data[1..]);
-                            if (target_endianness == .Little) for (versions) |*v| {
-                                v.* = @byteSwap(u16, v.*);
-                            };
-
-                            break :blk versions;
-                        };
-
-                        return Extension{ .supported_versions = @bitCast([]const u16, versions) };
-                    },
-                    .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = extension_data[1..] },
-                    .key_share => {
-                        const len = mem.readIntBig(u16, extension_data[0..2]);
-                        var keys = std.ArrayList(tls.KeyShare).init(gpa);
-                        defer keys.deinit();
-
-                        var i: usize = 0;
-                        while (i < len) {
-                            // allocate memory for a new key
-                            const key = try keys.addOne();
-
-                            // get the slice for current data
-                            const data = extension_data[i + 2 ..];
-
-                            // read named_group and the amount of bytes of public key
-                            const named_group = mem.readIntBig(u16, data[0..2]);
-                            const key_len = mem.readIntBig(u16, data[2..4]);
-
-                            // update pointer's value
-                            key.* = .{
-                                .named_group = @intToEnum(tls.NamedGroup, named_group),
-                                .key_exchange = data[4..][0..key_len],
-                            };
-                            i += key_len + 4;
-                        }
-
-                        return Extension{ .key_share = keys.toOwnedSlice() };
-                    },
-                    // For TLS 1.3 only 1 hostname can be provided which is always
-                    // of type DNS hostname. This means the hostname is the remaining
-                    // bytes after the 5th element.
-                    .server_name => return Extension{ .server_name = extension_data[5..] },
-                    .supported_groups => {
-                        var groups = mem.bytesAsSlice(u16, extension_data[2..]);
-                        if (target_endianness == .Little) for (groups) |*group| {
-                            group.* = @byteSwap(u16, group.*);
-                        };
-                        return Extension{ .supported_groups = @bitCast([]const tls.NamedGroup, groups) };
-                    },
-                    .signature_algorithms => {
-                        var algs = mem.bytesAsSlice(u16, extension_data[2..]);
-                        if (target_endianness == .Little) for (algs) |*alg| {
-                            alg.* = @byteSwap(u16, alg.*);
-                        };
-                        return Extension{ .signature_algorithms = @bitCast([]const tls.SignatureAlgorithm, algs) };
-                    },
-                    else => return error.UnsupportedExtension,
-                }
-            }
-        };
     };
 }
-
-/// Extension define what the client requests for extended functionality from servers.
-/// Note that some extensions are required for TLS 1.3 itself,
-/// while others are optional.
-const Extension = union(Tag) {
-    /// The supported TLS versions of the client.
-    supported_versions: []const u16,
-    /// The PSK key exchange modes the client supports
-    psk_key_exchange_modes: []const u8,
-    /// List of public keys and the key exchange required for them.
-    key_share: []const tls.KeyShare,
-    /// A list of signature algorithms the client supports
-    signature_algorithms: []const tls.SignatureAlgorithm,
-    /// The groups of curve types the client supports
-    supported_groups: []const tls.NamedGroup,
-    /// Hostname of the server the client wants to connect to
-    /// TLS uses this to determine which server certificate to use,
-    /// rather than requiring multiple servers.
-    server_name: []const u8,
-
-    // TODO: Implement the other types. Currently,
-    // they're just void types.
-    max_gragment_length,
-    status_request,
-    use_srtp,
-    heartbeat,
-    application_layer_protocol_negotation,
-    signed_certificate_timestamp,
-    client_certificate_type,
-    server_certificate_type,
-    pre_shared_key,
-    early_data,
-    cookie,
-    certificate_authorities,
-    oid_filters,
-    post_handshake_auth,
-    signature_algorithms_cert,
-
-    /// All extensions that are compatible with TLS 1.3
-    /// Some may be specified as an external rfc.
-    const Tag = enum(u16) {
-        server_name = 0,
-        max_gragment_length = 1,
-        status_request = 5,
-        supported_groups = 10,
-        signature_algorithms = 13,
-        use_srtp = 14,
-        heartbeat = 15,
-        application_layer_protocol_negotation = 16,
-        signed_certificate_timestamp = 18,
-        client_certificate_type = 19,
-        server_certificate_type = 20,
-        pre_shared_key = 41,
-        early_data = 42,
-        supported_versions = 43,
-        cookie = 44,
-        psk_key_exchange_modes = 45,
-        certificate_authorities = 47,
-        oid_filters = 48,
-        post_handshake_auth = 49,
-        signature_algorithms_cert = 50,
-        key_share = 51,
-
-        fn int(self: Tag) u16 {
-            return @enumToInt(self);
-        }
-    };
-};
 
 /// Initializes a new `HandshakeWriter`, deducing the type of a given
 /// instance of a `writer`. The handshake writer will construct all
@@ -383,8 +227,9 @@ test "Client Hello" {
         0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee,
         0xef, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6,
         0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe,
+        0xff,
         // Cipher suites
-        0xff, 0x00, 0x06, 0x13, 0x01,
+        0x00, 0x06, 0x13, 0x01,
         0x13, 0x02, 0x13, 0x03,
         // Compression methods
         0x01, 0x00,
@@ -418,5 +263,29 @@ test "Client Hello" {
 
     var fb_reader = std.io.fixedBufferStream(&data).reader();
     var hs_reader = handshakeReader(std.testing.allocator, fb_reader);
-    try hs_reader.decode();
+    const result = try hs_reader.decode();
+    const client_hello = result.client_hello;
+
+    try std.testing.expectEqual(@as(u16, 0x0303), client_hello.legacy_version);
+
+    // check random
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    }, &client_hello.random);
+
+    // check session id
+    try std.testing.expectEqualSlices(u8, &.{
+        0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6,
+        0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed,
+        0xee, 0xef, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4,
+        0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb,
+        0xfc, 0xfd, 0xfe, 0xff,
+    }, &client_hello.session_id);
+
+    var cipher_bytes = [_]u8{ 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 };
+    const ciphers = tls.bytesToTypedSlice(tls.CipherSuite, &cipher_bytes);
+    try std.testing.expectEqualSlices(tls.CipherSuite, ciphers, client_hello.cipher_suites);
 }
