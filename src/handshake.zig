@@ -28,6 +28,14 @@ pub const ReadError = error{
     EndOfStream,
 };
 
+/// Builds an error type representing both a `HandshakeReader`'s `Error`
+/// and a `HandshakeWriter`'s `Error` depending on a given `reader` and `writer`.
+pub fn ReadWriteError(reader: anytype, writer: anytype) type {
+    const ReaderError = HandshakeReader(@TypeOf(reader)).Error;
+    const WriterError = HandshakeWriter(@TypeOf(writer)).Error;
+    return ReaderError || WriterError;
+}
+
 /// Initializes a new reader that decodes and performs a handshake
 pub fn handshakeReader(reader: anytype) HandshakeReader(@TypeOf(reader)) {
     return HandshakeReader(@TypeOf(reader)).init(reader);

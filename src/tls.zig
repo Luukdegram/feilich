@@ -122,6 +122,13 @@ pub const CipherSuite = enum(u16) {
     }
 };
 
+/// Pre-shared Key Exchange Modes as described in section 4.2.9
+/// https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.9
+pub const PskKeyExchangeMode = enum(u8) {
+    psk_ke = 0,
+    psk_dhe_ke = 1,
+};
+
 /// Reads big endian bytes into a typed slice of `T`.
 /// Converts each element's bytes to target cpu's endianness.
 ///
@@ -173,7 +180,7 @@ pub const Extension = union(Tag) {
     /// The supported TLS versions of the client.
     supported_versions: []const u16,
     /// The PSK key exchange modes the client supports
-    psk_key_exchange_modes: []const u8,
+    psk_key_exchange_modes: []const PskKeyExchangeMode,
     /// List of public keys and the key exchange required for them.
     key_share: []const KeyShare,
     /// A list of signature algorithms the client supports
@@ -235,17 +242,27 @@ pub const Extension = union(Tag) {
 
     /// Constructs extensions as they are parsed.
     /// Allowing to to reduce the need for allocations.
-    const Iterator = struct {
+    pub const Iterator = struct {
         /// Mutable slice as we may require
         /// to byteswap elements to ensure correct endianness
         data: []u8,
         /// Current index into `data`
         index: usize,
 
+        /// Initializes a new instance of `Iterator` with given data.
+        pub fn init(data: []u8) Iterator {
+            return .{ .data = data, .index = 0 };
+        }
+
+        /// Sets `index` to '0', allowing to re-iterate over the extensions present in `data`.
+        pub fn reset(self: *Iterator) void {
+            self.index = 0;
+        }
+
         /// Parses the next extension, returning `null` when all extensions have been parsed.
         /// Will return `UnsupportedExtension` when an extension is not supported by TLS 1.3,
         /// or simply isn't implemented yet.
-        fn next(self: *Iterator, gpa: *Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
+        pub fn next(self: *Iterator, gpa: *Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
             if (self.index >= self.data.len) return null;
 
             const tag_byte = mem.readIntBig(u16, self.data[self.index..][0..2]);
@@ -256,19 +273,11 @@ pub const Extension = union(Tag) {
             self.index += extension_data.len;
 
             switch (@intToEnum(Extension.Tag, tag_byte)) {
-                .supported_versions => {
-                    const versions = blk: {
-                        var versions = mem.bytesAsSlice(u16, extension_data[1..]);
-                        if (target_endianness == .Little) for (versions) |*v| {
-                            v.* = @byteSwap(u16, v.*);
-                        };
-
-                        break :blk versions;
-                    };
-
-                    return Extension{ .supported_versions = @bitCast([]const u16, versions) };
-                },
-                .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = extension_data[1..] },
+                .supported_versions => return Extension{ .supported_versions = bytesToTypedSlice(u16, extension_data[1..]) },
+                .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = @bitCast(
+                    []const PskKeyExchangeMode,
+                    extension_data[1..],
+                ) },
                 .key_share => {
                     const len = mem.readIntBig(u16, extension_data[0..2]);
                     var keys = std.ArrayList(KeyShare).init(gpa);
@@ -300,20 +309,14 @@ pub const Extension = union(Tag) {
                 // of type DNS hostname. This means the hostname is the remaining
                 // bytes after the 5th element.
                 .server_name => return Extension{ .server_name = extension_data[5..] },
-                .supported_groups => {
-                    var groups = mem.bytesAsSlice(u16, extension_data[2..]);
-                    if (target_endianness == .Little) for (groups) |*group| {
-                        group.* = @byteSwap(u16, group.*);
-                    };
-                    return Extension{ .supported_groups = @bitCast([]const NamedGroup, groups) };
-                },
-                .signature_algorithms => {
-                    var algs = mem.bytesAsSlice(u16, extension_data[2..]);
-                    if (target_endianness == .Little) for (algs) |*alg| {
-                        alg.* = @byteSwap(u16, alg.*);
-                    };
-                    return Extension{ .signature_algorithms = @bitCast([]const SignatureAlgorithm, algs) };
-                },
+                .supported_groups => return Extension{ .supported_groups = bytesToTypedSlice(
+                    NamedGroup,
+                    extension_data[2..],
+                ) },
+                .signature_algorithms => return Extension{ .signature_algorithms = bytesToTypedSlice(
+                    SignatureAlgorithm,
+                    extension_data[2..],
+                ) },
                 else => return error.UnsupportedExtension,
             }
         }
@@ -372,8 +375,8 @@ test "Extension iterator" {
                 algs,
             ),
             .psk_key_exchange_modes => |modes| try std.testing.expectEqualSlices(
-                u8,
-                &.{0x01},
+                PskKeyExchangeMode,
+                &.{.psk_dhe_ke},
                 modes,
             ),
             else => {}, //TODO: Implement all extensions
