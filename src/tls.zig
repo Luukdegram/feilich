@@ -2,6 +2,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const crypto = std.crypto;
 
 /// Target cpu's endianness. Use this to check if byte swapping is required.
 const target_endianness = std.builtin.target.cpu.arch.endian();
@@ -154,7 +155,7 @@ pub const KeyShare = struct {
     /// The key exchange (i.e. curve25519)
     named_group: NamedGroup,
     /// The public key of the client
-    key_exchange: []const u8,
+    key_exchange: [32]u8,
 
     /// Returns the total bytes it will write to a TLS connection
     /// during a handshake
@@ -294,11 +295,12 @@ pub const Extension = union(Tag) {
                         // read named_group and the amount of bytes of public key
                         const named_group = mem.readIntBig(u16, data[0..2]);
                         const key_len = mem.readIntBig(u16, data[2..4]);
+                        _ = key_len;
 
                         // update pointer's value
                         key.* = .{
                             .named_group = @intToEnum(NamedGroup, named_group),
-                            .key_exchange = data[4..][0..key_len],
+                            .key_exchange = data[4..][0..32].*,
                         };
                         i += key_len + 4;
                     }
@@ -382,4 +384,76 @@ test "Extension iterator" {
             else => {}, //TODO: Implement all extensions
         }
     }
+}
+
+/// Represents a private and public key for either the server
+/// or a client.
+pub const KeyExchange = struct {
+    private_key: [32]u8,
+    public_key: [32]u8,
+
+    /// Generates a new private/public key pair using the given curve.
+    pub fn fromCurve(curve: *Curve) Curve.Error!KeyExchange {
+        var exchange: KeyExchange = undefined;
+        crypto.random.bytes(&exchange.private_key);
+        try curve.generateKey(exchange.private_key, &exchange.public_key);
+        return exchange;
+    }
+};
+
+/// Curve allows us to generate a public key for a given
+/// private key, using a generation function provided
+/// by an implementation.
+pub const Curve = struct {
+    /// Error which can occur when generating the public key
+    pub const Error = crypto.errors.IdentityElementError;
+    genFn: fn (self: *Curve, private_key: [32]u8, public_key_out: *[32]u8) Error!void,
+
+    /// Generates a new public key from a given private key.
+    /// Writes the output of the curve function to `public_key_out`.
+    pub fn generateKey(self: *Curve, private_key: [32]u8, public_key_out: *[32]u8) Error!void {
+        try self.genFn(self, private_key, public_key_out);
+    }
+};
+
+/// Namespace of implemented curves, that can be used
+/// to generate keys.
+pub const curves = struct {
+    const _x25519 = struct {
+        var state = Curve{ .genFn = gen };
+
+        fn gen(curve: *Curve, private_key: [32]u8, public_key_out: *[32]u8) !void {
+            _ = curve;
+            public_key_out.* = try crypto.dh.X25519.recoverPublicKey(private_key);
+        }
+    };
+    /// Provides a x25519 elliptic curve to construct a private/public key-pair.
+    pub const x25519 = &_x25519.state;
+};
+
+test "x25519 curve" {
+    const x_curve = curves.x25519;
+    const private_key = [_]u8{
+        0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+        0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    };
+
+    const expected_public_key = [_]u8{
+        0x9f, 0xd7, 0xad, 0x6d, 0xcf, 0xf4, 0x29, 0x8d,
+        0xd3, 0xf9, 0x6d, 0x5b, 0x1b, 0x2a, 0xf9, 0x10,
+        0xa0, 0x53, 0x5b, 0x14, 0x88, 0xd7, 0xf8, 0xfa,
+        0xbb, 0x34, 0x9a, 0x98, 0x28, 0x80, 0xb6, 0x15,
+    };
+
+    var public_key: [32]u8 = undefined;
+    try x_curve.generateKey(private_key, &public_key);
+
+    try std.testing.expectEqualSlices(u8, &expected_public_key, &public_key);
+
+    const exchange = try KeyExchange.fromCurve(x_curve);
+    var test_key: [32]u8 = undefined;
+    try x_curve.generateKey(exchange.private_key, &test_key);
+    try std.testing.expectEqualSlices(u8, &exchange.public_key, &test_key);
 }
