@@ -53,6 +53,54 @@ pub const Record = extern struct {
     }
 };
 
+/// Types of alerts we can emit or receive
+/// Known as AlertDescription by TLS
+pub const Alert = enum(u8) {
+    close_notify = 0,
+    unexpected_message = 10,
+    bad_record_mac = 20,
+    record_overflow = 22,
+    handshake_failure = 40,
+    bad_certificate = 42,
+    unsupported_certificate = 43,
+    certificate_revoked = 44,
+    certificate_expired = 45,
+    certificate_unknown = 46,
+    illegal_parameter = 47,
+    unknown_ca = 48,
+    access_denied = 49,
+    decode_error = 50,
+    decrypt_error = 51,
+    protocol_version = 70,
+    insufficient_security = 71,
+    internal_error = 80,
+    inappropriate_fallback = 86,
+    user_canceled = 90,
+    missing_extension = 109,
+    unsupported_extension = 110,
+    unrecognized_name = 112,
+    bad_certificate_status_response = 113,
+    unknown_psk_identity = 115,
+    certificate_required = 116,
+    no_application_protocol = 120,
+
+    pub fn int(self: Alert) u8 {
+        return @enumToInt(self);
+    }
+};
+
+/// Represents the severity of the alert.
+/// When the level is `fatal`, no more data must be read
+/// or written to the connection.
+pub const AlertLevel = enum(u8) {
+    warning = 1,
+    fatal = 2,
+
+    pub fn int(self: AlertLevel) u8 {
+        return @enumToInt(self);
+    }
+};
+
 /// Represents the key exchange that is supported by the client or server
 /// Prior to TLS 1.3 this was called 'elliptic_curves' and only contained elliptic curve groups.
 pub const NamedGroup = enum(u16) {
@@ -74,6 +122,23 @@ pub const NamedGroup = enum(u16) {
 
     pub fn int(self: NamedGroup) u16 {
         return @enumToInt(self);
+    }
+};
+
+/// Provides a list of supported `NamedGroup` by this library
+/// that have been implemented. Meaning this may contain only
+/// a subset of all groups that TLS 1.3 may support.
+pub const supported_named_groups = struct {
+    pub const set: []const NamedGroup = &.{
+        .x25519,
+    };
+
+    /// Verifies if a given `NamedGroup` is supported by this library.
+    /// Returns false if the group isn't implemented/supported yet.
+    pub fn isSupported(group: NamedGroup) bool {
+        return for (set) |g| {
+            if (g == group) break true;
+        } else false;
     }
 };
 
@@ -110,6 +175,22 @@ pub const SignatureAlgorithm = enum(u16) {
     _,
 };
 
+/// Table of supported `SignatureAlgorithm` of this library
+/// This may only include a subset of the enum values found in
+/// `SignatureAlgorithm` itself.
+pub const supported_signature_algorithms = struct {
+    pub const set: []const SignatureAlgorithm = &.{
+        .ed25519,
+    };
+
+    /// Checks if a given `SignatureAlgorithm` is supported by the library.
+    pub fn isSupported(signature: SignatureAlgorithm) bool {
+        return for (set) |alg| {
+            if (alg == signature) break true;
+        } else false;
+    }
+};
+
 /// Supported cipher suites by TLS 1.3
 pub const CipherSuite = enum(u16) {
     tls_aes_128_gcm_sha256 = 0x1301,
@@ -120,6 +201,25 @@ pub const CipherSuite = enum(u16) {
 
     pub fn int(self: CipherSuite) u16 {
         return @enumToInt(self);
+    }
+};
+
+/// Table of supported `CipherSuite` of this library.
+/// This may contain only a subset of the all suites
+/// that are supported by TLS 1.3 itself.
+pub const supported_cipher_suites = struct {
+    pub const set: []const CipherSuite = &.{
+        .tls_aes_128_ccm_sha256,
+        .tls_aes_256_gcm_sha384,
+        .tls_chacha20_poly1305_sha256,
+    };
+
+    /// Returns true when a given `CipherSuite` is supported
+    /// by this library.
+    pub fn isSupported(suite: CipherSuite) bool {
+        return for (set) |item| {
+            if (item == suite) break true;
+        } else false;
     }
 };
 
