@@ -29,6 +29,9 @@ pub const Server = struct {
         /// None of the cipher suites provided by the client are
         /// currently supported by the server.
         UnsupportedCipherSuite,
+        /// The signate algorithms provided by the client
+        /// are not supported by the server.
+        UnsupportedSignatureAlgorithm,
     };
 
     /// Initializes a new `Server` instance for a given public/private key pair.
@@ -49,8 +52,17 @@ pub const Server = struct {
         var handshake_reader = handshake.handshakeReader(reader);
         var handshake_writer = handshake.handshakeWriter(writer);
 
+        var client_key_share: tls.KeyShare = undefined;
+        var server_key_share: tls.KeyShare = undefined;
+        var signature: tls.SignatureAlgorithm = undefined;
+        var server_exchange: tls.KeyExchange = undefined;
+
         // A client requested to connect with the server,
         // verify a client hello message.
+        //
+        // We're using a while loop here as we may send a HelloRetryRequest
+        // in which the client will send a new helloClient.
+        // When a succesful hello reply was sent, we continue the regular path.
         while (true) {
             const hello_result = try handshake_reader.decode();
             switch (hello_result) {
@@ -109,7 +121,12 @@ pub const Server = struct {
                                 else => {},
                             }
                         } else |err| switch (err) {
-                            error.UnsupportedExtension => continue :loop,
+                            error.UnsupportedExtension => {
+                                try writeAlert(.warning, .unsupported_extension, writer);
+                                // unsupported extensions are a warning, we do not need to support
+                                // them all. Simply continue the loop when we find one.
+                                continue :loop;
+                            },
                             else => return err,
                         }
                     }
@@ -119,17 +136,17 @@ pub const Server = struct {
                         return error.UnsupportedVersion;
                     }
 
-                    const client_exchange = key_share orelse {
+                    client_key_share = key_share orelse {
                         try writeAlert(.fatal, .handshake_failure, writer);
                         return error.UnsupportedNamedGroup;
                     };
 
-                    // TODO: Save this information as we require it
-                    // to decrypt client messages.
-                    _ = client_exchange;
+                    signature = chosen_signature orelse {
+                        try writeAlert(.fatal, .handshake_failure, writer);
+                        return error.UnsupportedSignatureAlgorithm;
+                    };
 
-                    var server_exchange: tls.KeyExchange = undefined;
-                    const server_key = blk: {
+                    server_key_share = blk: {
                         const group = chosen_group orelse {
                             try writeAlert(.fatal, .handshake_failure, writer);
                             return error.UnsupportedNamedGroup;
@@ -148,10 +165,27 @@ pub const Server = struct {
                         suite,
                         server_key,
                     );
+
+                    // We sent our hello server, meaning we can continue
+                    // the regular path.
+                    break;
                 },
                 else => return error.UnexpectedMessage,
             }
         }
+
+        // generate handshake key, which is constructed by multiplying
+        // the client's public key with the server's private key using the negotiated
+        // named group.
+        const curve = std.crypto.ecc.Curve25519.fromBytes(client_key_share.key_exchange);
+        const handshake_key = curve.mul(server_exchange.private_key) catch |err| switch (err) {
+            error.WeakPublicKeyError => |e| {
+                try writeAlert(.fatal, .insufficient_security, writer);
+                return e;
+            },
+            else => |e| return e,
+        };
+        std.debug.print("Handshake key {d:2>0}\n", .{std.fmt.fmtSliceHexLower(&handshake_key.toBytes())});
     }
 
     /// Constructs an alert record and writes it to the client's connection.

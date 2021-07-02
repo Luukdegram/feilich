@@ -150,7 +150,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
 
         writer: WriterType,
 
-        const Error = WriteError || WriterType.Error;
+        const Error = WriterType.Error;
 
         /// Constructs and sends a 'Server Hello' message to the client.
         /// This must be called, after a succesful 'Client Hello' message was received.
