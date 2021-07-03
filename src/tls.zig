@@ -3,6 +3,7 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const crypto = std.crypto;
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 
 /// Target cpu's endianness. Use this to check if byte swapping is required.
 const target_endianness = std.builtin.target.cpu.arch.endian();
@@ -556,4 +557,46 @@ test "x25519 curve" {
     var test_key: [32]u8 = undefined;
     try x_curve.generateKey(exchange.private_key, &test_key);
     try std.testing.expectEqualSlices(u8, &exchange.public_key, &test_key);
+}
+
+/// Uses hkdf's expand to generate a derived key.
+/// Constructs a hkdf context by generating a hkdf-label
+/// which consists of `length`, the label "tls13 " ++ `label` and the given
+/// `context`.
+pub fn hkdfExpandLabel(
+    secret: [32]u8,
+    comptime label: []const u8,
+    context: []const u8,
+    comptime length: u16,
+) [length]u8 {
+    std.debug.assert(label.len <= 255 and label.len > 0);
+    std.debug.assert(context.len <= 255);
+    const full_label = "tls13 " ++ label;
+
+    // length, label, context
+    var buf: [2 + 255 + 255]u8 = undefined;
+    std.mem.writeIntBig(u16, buf[0..2], length);
+    buf[2] = full_label.len;
+    std.mem.copy(u8, buf[3..], full_label);
+    buf[3 + full_label.len] = @intCast(u8, context.len);
+    std.mem.copy(u8, buf[4 + full_label.len ..], context);
+    const actual_context = buf[0 .. 4 + full_label.len + context.len];
+
+    var out: [32]u8 = undefined;
+    HkdfSha256.expand(&out, actual_context, secret);
+    return out[0..length].*;
+}
+
+test "hkdfExpandLabel" {
+    const early_secret = HkdfSha256.extract(&.{}, &[_]u8{0} ** 32);
+    var empty_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
+    const derived_secret = hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x6f, 0x26, 0x15, 0xa1, 0x08, 0xc7, 0x02,
+        0xc5, 0x67, 0x8f, 0x54, 0xfc, 0x9d, 0xba,
+        0xb6, 0x97, 0x16, 0xc0, 0x76, 0x18, 0x9c,
+        0x48, 0x25, 0x0c, 0xeb, 0xea, 0xc3, 0x57,
+        0x6c, 0x36, 0x11, 0xba,
+    }, &derived_secret);
 }
