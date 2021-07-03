@@ -6,6 +6,9 @@ const tls = @import("tls.zig");
 const handshake = @import("handshake.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const crypto = std.crypto;
+const Sha256 = crypto.hash.sha2.Sha256;
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 
 /// Server is a data object, containing the
 /// private and public key for the TLS 1.3 connection.
@@ -178,14 +181,17 @@ pub const Server = struct {
         // the client's public key with the server's private key using the negotiated
         // named group.
         const curve = std.crypto.ecc.Curve25519.fromBytes(client_key_share.key_exchange);
-        const handshake_key = curve.mul(server_exchange.private_key) catch |err| switch (err) {
+        const shared_key = curve.mul(server_exchange.private_key) catch |err| switch (err) {
             error.WeakPublicKeyError => |e| {
                 try writeAlert(.fatal, .insufficient_security, writer);
                 return e;
             },
             else => |e| return e,
         };
-        std.debug.print("Handshake key {d:2>0}\n", .{std.fmt.fmtSliceHexLower(&handshake_key.toBytes())});
+
+        const early_secret = HkdfSha256.extract("", &[_]u8{0} ** 32);
+        _ = early_secret;
+        _ = shared_key;
     }
 
     /// Constructs an alert record and writes it to the client's connection.
