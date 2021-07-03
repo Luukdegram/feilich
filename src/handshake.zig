@@ -3,6 +3,7 @@
 const std = @import("std");
 const tls = @import("tls.zig");
 const mem = std.mem;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Represents the possible handshake types
 pub const HandshakeType = enum(u8) {
@@ -37,8 +38,8 @@ pub fn ReadWriteError(reader: anytype, writer: anytype) type {
 }
 
 /// Initializes a new reader that decodes and performs a handshake
-pub fn handshakeReader(reader: anytype) HandshakeReader(@TypeOf(reader)) {
-    return HandshakeReader(@TypeOf(reader)).init(reader);
+pub fn handshakeReader(reader: anytype, hasher: Sha256) HandshakeReader(@TypeOf(reader)) {
+    return HandshakeReader(@TypeOf(reader)).init(reader, hasher);
 }
 
 /// Generic handshake reader that will perform a handshake and decode all
@@ -46,8 +47,9 @@ pub fn handshakeReader(reader: anytype) HandshakeReader(@TypeOf(reader)) {
 pub fn HandshakeReader(comptime ReaderType: type) type {
     return struct {
         const Self = @This();
-        /// Reader we're reading from
-        reader: ReaderType,
+        /// HashReader that will read from the stream
+        /// and then hash its contents.
+        reader: HashReader(ReaderType),
 
         pub const Error = ReadError || ReaderType.Error;
 
@@ -67,14 +69,15 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
         /// Initializes a new instance of `HandshakeReader` of a given reader that must be of
         /// `ReaderType`.
-        pub fn init(reader: ReaderType) Self {
-            return .{ .reader = reader };
+        pub fn init(reader: ReaderType, hasher: Sha256) Self {
+            return .{ .reader = HashReader(ReaderType).init(reader, hasher) };
         }
 
         /// Starts reading from the reader and will try to perform a handshake.
         pub fn decode(self: *Self) Error!Result {
-            const handshake_type = try self.reader.readByte();
-            const remaining_length = try self.reader.readIntBig(u24);
+            var reader = self.reader.reader();
+            const handshake_type = try reader.readByte();
+            const remaining_length = try reader.readIntBig(u24);
 
             switch (@intToEnum(HandshakeType, handshake_type)) {
                 .client_hello => return Result{ .client_hello = try self.decodeClientHello(remaining_length) },
@@ -90,7 +93,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
             // maximum length of an entire record (record header + message)
             var buf: [1 << 14]u8 = undefined;
-            try self.reader.readNoEof(buf[0..message_length]);
+            try self.reader.reader().readNoEof(buf[0..message_length]);
             const content = buf[0..message_length];
             result.legacy_version = mem.readIntBig(u16, content[0..2]);
             // current index into `contents`
@@ -138,8 +141,8 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 /// Initializes a new `HandshakeWriter`, deducing the type of a given
 /// instance of a `writer`. The handshake writer will construct all
 /// required messages for a succesful handshake.
-pub fn handshakeWriter(writer: anytype) HandshakeWriter(@TypeOf(writer)) {
-    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer);
+pub fn handshakeWriter(writer: anytype, hasher: Sha256) HandshakeWriter(@TypeOf(writer)) {
+    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer, hasher);
 }
 
 /// Creates a new HandshakeWriter using a given writer type.
@@ -148,9 +151,15 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
     return struct {
         const Self = @This();
 
-        writer: WriterType,
+        writer: HashWriter(WriterType),
 
         const Error = WriterType.Error;
+
+        /// Initializes a new `HandshakeWriter` by wrapping the given `writer` into
+        /// a `HashWriter` and setting up the hasher.
+        pub fn init(writer: WriterType, hasher: Sha256) Self {
+            return .{ .writer = HashWriter(WriterType).init(writer, hasher) };
+        }
 
         /// Constructs and sends a 'Server Hello' message to the client.
         /// This must be called, after a succesful 'Client Hello' message was received.
@@ -171,16 +180,17 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             /// on the client's Key Share.
             key_share: tls.KeyShare,
         ) Error!void {
-            try self.writer.writeByte(HandshakeType.server_hello.int());
+            const writer = self.writer.writer();
+            try writer.writeByte(HandshakeType.server_hello.int());
 
             // The total amount of bytes the client must read to decode the
             // entire 'server hello' message.
             // TODO: byteLen returns the full length, but when `kind` is `retry_request`
             // we will only send the `named_group`, and not the key exchange.
-            try self.writer.writeIntBig(u16, 76 + key_share.byteLen());
+            try writer.writeIntBig(u16, 76 + key_share.byteLen());
 
             // Means TLS 1.2, this is legacy and actual version is sent through extensions
-            try self.writer.writeIntBig(u16, 0x303);
+            try writer.writeIntBig(u16, 0x303);
 
             const server_random = switch (kind) {
                 .server_hello => blk: {
@@ -199,26 +209,26 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                     break :blk random;
                 },
             };
-            try self.writer.writeAll(server_random);
+            try writer.writeAll(server_random);
 
             // session_id is legacy and no longer used. In TLS 1.3 we
             // can just 'echo' client's session id.
-            try self.writer.writeAll(session_id);
+            try writer.writeAll(session_id);
 
             // cipher suite
-            try self.writer.writeIntBig(u16, cipher_suite.int());
+            try writer.writeIntBig(u16, cipher_suite.int());
 
             // Compression methods, which is no longer allowed for TLS 1.3 so assign "null"
             const compression_methods = &[_]u8{ 0x1, 0x00 };
-            try self.writer.writeAll(compression_methods);
+            try writer.writeAll(compression_methods);
 
             // write the extension length (46 bytes)
-            try self.writer.writeIntBig(u16, 0x002E);
+            try writer.writeIntBig(u16, 0x002E);
             total_data += 2;
 
             // Extension -- Key Share
             // TODO: When sending a retry, we should only send the named_group we want.
-            try key_share.writeTo(self.writer);
+            try key_share.writeTo(writer);
 
             // Extension -- Supported versions
             const supported_versions = &[_]u8{
@@ -229,7 +239,64 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 // actual version (TLS 1.3)
                 0x03, 0x04,
             };
-            try self.writer.writeAll(supported_versions);
+            try writer.writeAll(supported_versions);
+        }
+    };
+}
+
+/// Constructs a reader that hashes each read's content
+/// NOTE: It reads raw data, not hashed data.
+fn HashReader(comptime ReaderType: type) type {
+    return struct {
+        const Self = @This();
+        hash: Sha256,
+        any_reader: ReaderType,
+
+        const Error = ReaderType.Error;
+
+        pub fn init(any_reader: ReaderType, hash: Sha256) Self {
+            return .{ .any_reader = any_reader, .hash = hash };
+        }
+
+        pub fn read(self: *Self, buf: []u8) Error!usize {
+            const len = try self.any_reader.read(buf);
+            if (len != 0) {
+                self.hash.update(buf[0..len]);
+            }
+            return len;
+        }
+
+        pub fn reader(self: *Self) std.io.Reader(*Self, Error, read) {
+            return .{ .context = self };
+        }
+    };
+}
+
+/// Constructs a writer that hashes each write's content
+/// NOTE: It does not write the hashed content.
+fn HashWriter(comptime WriterType: type) type {
+    return struct {
+        const Self = @This();
+
+        hash: Sha256,
+        any_writer: WriterType,
+
+        const Error = ReaderType.Error;
+
+        pub fn init(any_writer: WriterType, hash: Sha256) Self {
+            return .{ .any_writer = any_writer, .hash = hash };
+        }
+
+        pub fn write(self: *Self, bytes: []const u8) Error!usize {
+            const len = self.any_writer.write(bytes);
+            if (len != 0) {
+                self.hash.update(bytes[0..len]);
+            }
+            return len;
+        }
+
+        pub fn writer(self: *Self) std.io.Writer(*Self, Error, write) {
+            return .{ .context = self };
         }
     };
 }
@@ -289,7 +356,8 @@ test "Client Hello" {
     // zig fmt: on
 
     var fb_reader = std.io.fixedBufferStream(&data).reader();
-    var hs_reader = handshakeReader(fb_reader);
+    var hasher = Sha256.init(.{});
+    var hs_reader = handshakeReader(fb_reader, hasher);
     const result = try hs_reader.decode();
     const client_hello = result.client_hello;
 
