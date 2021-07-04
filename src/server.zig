@@ -9,6 +9,7 @@ const Allocator = mem.Allocator;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
+const Curve25519 = crypto.ecc.Curve25519;
 
 /// Server is a data object, containing the
 /// private and public key for the TLS 1.3 connection.
@@ -35,6 +36,10 @@ pub const Server = struct {
         /// The signate algorithms provided by the client
         /// are not supported by the server.
         UnsupportedSignatureAlgorithm,
+        /// The client has sent a record whose length exceeds 2^14-1 bytes
+        IllegalLength,
+        /// Client has sent an unexpected record type
+        UnexpectedRecordType,
     };
 
     /// Initializes a new `Server` instance for a given public/private key pair.
@@ -60,6 +65,20 @@ pub const Server = struct {
         var server_key_share: tls.KeyShare = undefined;
         var signature: tls.SignatureAlgorithm = undefined;
         var server_exchange: tls.KeyExchange = undefined;
+
+        const record = try tls.Record.readFrom(reader);
+        if (record.protocol_version != 0x0303) {
+            try writeAlert(.fatal, .protocol_version, writer);
+            return error.UnsupportedVersion;
+        }
+        if (record.len > 1 << 14) {
+            try writeAlert(.fatal, .record_overflow, writer);
+            return error.IllegalLength;
+        }
+        if (record.record_type != .handshake) {
+            try writeAlert(.fatal, writer);
+            return error.UnexpectedRecordType;
+        }
 
         // A client requested to connect with the server,
         // verify a client hello message.
@@ -163,6 +182,12 @@ pub const Server = struct {
                         };
                     };
 
+                    // Non-hashed write to send the record header with length
+                    // 122 bytes.
+                    // TODO: Not hardcore the length
+                    try (tls.Record.init(.handshake, 0x007a)).writeTo(writer);
+
+                    // hash and write the server hello
                     try handshake_writer.serverHello(
                         .server_hello,
                         client_result.session_id,
@@ -182,7 +207,7 @@ pub const Server = struct {
         // the client's public key with the server's private key using the negotiated
         // named group.
         const curve = std.crypto.ecc.Curve25519.fromBytes(client_key_share.key_exchange);
-        const shared_key = curve.mul(server_exchange.private_key) catch |err| switch (err) {
+        const shared_key = curve.clampedMul(server_exchange.private_key) catch |err| switch (err) {
             error.WeakPublicKeyError => |e| {
                 try writeAlert(.fatal, .insufficient_security, writer);
                 return e;
@@ -190,13 +215,45 @@ pub const Server = struct {
             else => |e| return e,
         };
 
-        var derived_secret: [32]u8 = undefined;
+        // Calculate the handshake keys
+        // Since we do not yet support PSK resumation,
+        // we first build an early secret which we use to
+        // expand our keys later on.
+        var empty_hash: [32]u8 = undefined;
         const early_secret = HkdfSha256.extract("", &[_]u8{0} ** 32);
+        Sha256.hash("", &empty_hash, .{});
         HkdfSha256.expand(&derived_secret, "tls13derived", early_secret);
+        const derived_secret = tls.hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
         const handshake_secret = HkdfSha256.extract(&derived_secret, &shared_key.toBytes());
-        _ = handshake_secret;
-        _ = early_secret;
-        _ = shared_key;
+
+        const current_hash: [32]u8 = blk: {
+            var temp_hasher = hasher;
+            var buf: [32]u8 = undefined;
+            temp_hasher.final(&buf);
+            break :blk buf;
+        };
+        const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
+        const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
+
+        const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", 16);
+        const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", 16);
+
+        const client_handshake_iv = blk: {
+            var buf: [32]u8 = undefined;
+            std.mem.copy(u8, &buf, client_secret);
+            break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
+        };
+
+        const server_handshake_iv = blk: {
+            var buf: [32]u8 = undefined;
+            std.mem.copy(u8, &buf, server_secret);
+            break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
+        };
+
+        try tls.Record.init(.application_data, 0x0475).writeTo(writer);
+
+        _ = client_handshake_iv;
+        _ = server_handshake_iv;
     }
 
     /// Constructs an alert record and writes it to the client's connection.
@@ -207,6 +264,31 @@ pub const Server = struct {
         try writer.writeAll(&.{ severity.int(), alert.int() });
     }
 };
+
+test "Shared key generation" {
+    const client_public_key: [32]u8 = .{
+        0x35, 0x80, 0x72, 0xd6, 0x36, 0x58, 0x80, 0xd1,
+        0xae, 0xea, 0x32, 0x9a, 0xdf, 0x91, 0x21, 0x38,
+        0x38, 0x51, 0xed, 0x21, 0xa2, 0x8e, 0x3b, 0x75,
+        0xe9, 0x65, 0xd0, 0xd2, 0xcd, 0x16, 0x62, 0x54,
+    };
+    const server_private_key: [32]u8 = .{
+        0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+        0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    };
+    const curve = Curve25519.fromBytes(client_public_key);
+    const shared = try curve.clampedMul(server_private_key);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0xdf, 0x4a, 0x29, 0x1b, 0xaa, 0x1e, 0xb7,
+        0xcf, 0xa6, 0x93, 0x4b, 0x29, 0xb4, 0x74,
+        0xba, 0xad, 0x26, 0x97, 0xe2, 0x9f, 0x1f,
+        0x92, 0x0d, 0xcc, 0x77, 0xc8, 0xa0, 0xa0,
+        0x88, 0x44, 0x76, 0x24,
+    }, &shared.toBytes());
+}
 
 // Uses example data from https://tls13.ulfheim.net/ to verify
 // its output
@@ -225,7 +307,7 @@ test "Handshake keys calculation" {
     };
     const early_secret = HkdfSha256.extract(&.{}, &[_]u8{0} ** 32);
     var empty_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
+    Sha256.hash("", &empty_hash, .{});
     const derived_secret = tls.hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
     try std.testing.expectEqualSlices(u8, &.{
         0x6f, 0x26, 0x15, 0xa1, 0x08, 0xc7, 0x02,
