@@ -14,4 +14,14 @@ pub fn build(b: *std.build.Builder) void {
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);
+
+    const example = b.addExecutable("server", "examples/server.zig");
+    example.setBuildMode(mode);
+    example.addPackagePath("feilich", "src/feilich.zig");
+
+    const example_run_step = example.run();
+    example_run_step.step.dependOn(&example.step);
+
+    const example_cmd_step = b.step("example-server", "Sets up an example tls 1.3 http server");
+    example_cmd_step.dependOn(&example_run_step.step);
 }

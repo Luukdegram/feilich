@@ -1,5 +1,9 @@
 //! Contains the data and logic to perform
 //! a TLS 1.3 handshake
+//! This does however not contain the logic to generate
+//! and verify any of the handshake keys required to sign and
+//! verify the messages.
+
 const std = @import("std");
 const tls = @import("tls.zig");
 const mem = std.mem;
@@ -31,9 +35,9 @@ pub const ReadError = error{
 
 /// Builds an error type representing both a `HandshakeReader`'s `Error`
 /// and a `HandshakeWriter`'s `Error` depending on a given `reader` and `writer`.
-pub fn ReadWriteError(reader: anytype, writer: anytype) type {
-    const ReaderError = HandshakeReader(@TypeOf(reader)).Error;
-    const WriterError = HandshakeWriter(@TypeOf(writer)).Error;
+pub fn ReadWriteError(comptime ReaderType: type, comptime WriterType: type) type {
+    const ReaderError = HandshakeReader(ReaderType).Error;
+    const WriterError = HandshakeWriter(WriterType).Error;
     return ReaderError || WriterError;
 }
 
@@ -60,7 +64,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
             cipher_suites: []const tls.CipherSuite,
             /// Represents the extensions as raw bytes
             /// Utilize ExtensionIterator to iterate over.
-            extensions: []const u8,
+            extensions: []u8,
         };
 
         const Result = union(enum) {
@@ -142,7 +146,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 /// instance of a `writer`. The handshake writer will construct all
 /// required messages for a succesful handshake.
 pub fn handshakeWriter(writer: anytype, hasher: Sha256) HandshakeWriter(@TypeOf(writer)) {
-    return HandshakeWriter(@TypeOf(HandshakeWriter)).init(writer, hasher);
+    return HandshakeWriter(@TypeOf(writer)).init(writer, hasher);
 }
 
 /// Creates a new HandshakeWriter using a given writer type.
@@ -199,21 +203,21 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                     // https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
                     var seed: [32]u8 = undefined;
                     std.crypto.random.bytes(&seed);
-                    break :blk;
+                    break :blk seed;
                 },
                 .retry_request => blk: {
                     // When sending a hello retry request, the random must always be the
                     // SHA-256 of "HelloRetryRequest"
-                    var random: [u32]u8 = undefined;
+                    var random: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash("HelloRetryRequest", &random, .{});
                     break :blk random;
                 },
             };
-            try writer.writeAll(server_random);
+            try writer.writeAll(&server_random);
 
             // session_id is legacy and no longer used. In TLS 1.3 we
             // can just 'echo' client's session id.
-            try writer.writeAll(session_id);
+            try writer.writeAll(&session_id);
 
             // cipher suite
             try writer.writeIntBig(u16, cipher_suite.int());
@@ -224,7 +228,6 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
 
             // write the extension length (46 bytes)
             try writer.writeIntBig(u16, 0x002E);
-            total_data += 2;
 
             // Extension -- Key Share
             // TODO: When sending a retry, we should only send the named_group we want.
@@ -281,14 +284,14 @@ fn HashWriter(comptime WriterType: type) type {
         hash: Sha256,
         any_writer: WriterType,
 
-        const Error = ReaderType.Error;
+        const Error = WriterType.Error;
 
         pub fn init(any_writer: WriterType, hash: Sha256) Self {
             return .{ .any_writer = any_writer, .hash = hash };
         }
 
         pub fn write(self: *Self, bytes: []const u8) Error!usize {
-            const len = self.any_writer.write(bytes);
+            const len = try self.any_writer.write(bytes);
             if (len != 0) {
                 self.hash.update(bytes[0..len]);
             }

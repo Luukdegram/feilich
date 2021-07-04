@@ -32,7 +32,7 @@ pub const Record = extern struct {
     };
 
     /// Initializes a new `Record` that always has its `protocol_version` set to 0x0303.
-    pub fn init(record_type: RecordType, len: usize) Record {
+    pub fn init(record_type: RecordType, len: u16) Record {
         return .{ .record_type = record_type, .len = len };
     }
 
@@ -271,7 +271,7 @@ pub const KeyShare = struct {
         try writer.writeIntBig(u16, 0x0024); // length (36 bytes)
         try writer.writeIntBig(u16, self.named_group.int());
         try writer.writeIntBig(u16, 0x0020); // public key length (32 bytes)
-        try writer.writeAll(self.key_exchange);
+        try writer.writeAll(&self.key_exchange);
     }
 };
 
@@ -336,6 +336,8 @@ pub const Extension = union(Tag) {
         post_handshake_auth = 49,
         signature_algorithms_cert = 50,
         key_share = 51,
+        /// Unsupported 'legacy' extensions
+        _,
 
         pub fn int(self: Tag) u16 {
             return @enumToInt(self);
