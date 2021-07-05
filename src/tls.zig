@@ -182,6 +182,7 @@ pub const SignatureAlgorithm = enum(u16) {
 pub const supported_signature_algorithms = struct {
     pub const set: []const SignatureAlgorithm = &.{
         .ed25519,
+        .rsa_pss_rsae_sha256,
     };
 
     /// Checks if a given `SignatureAlgorithm` is supported by the library.
