@@ -31,7 +31,7 @@ pub const PrivateKey = struct {
         return self.public_key.modulus.bitCountAbs();
     }
 
-    fn decryptAndCheck(self: PrivateKey, c: big_int.Managed) !big_int.Managed {}
+    // fn decryptAndCheck(self: PrivateKey, c: big_int.Managed) !big_int.Managed {}
 };
 
 /// Generates a multi-prime RSA keypair of the given of the given bit size
@@ -55,14 +55,17 @@ pub fn generateKeyPair(bits: usize) !PrivateKey {
     }
 
     var primes: [2]big_int.Const = undefined;
+    _ = primes;
 
-    prime_calc: while (true) {
-        var todo = bits;
+    // prime_calc: while (true) {
+    //     var todo = bits;
+    //     _ = todo;
 
-        for (primes) |*prime| {
-            // prime.* = std.math.prime
-        }
-    }
+    //     for (primes) |*prime| {
+    //         _ = prime;
+    //         // prime.* = std.math.prime
+    //     }
+    // }
 }
 
 const _Pss = struct {
@@ -100,14 +103,17 @@ const _Pss = struct {
 
         const checked = try private_key.decryptAndCheck(managed);
         const s = gpa.alloc(u8, private_key.size());
+        _ = s;
+        _ = checked;
     }
 
-    fn emsaPssEncode(hashed: []const u8, em_bit_count: usize, salt: []const u8) ![]const u8 {}
+    // fn emsaPssEncode(hashed: []const u8, em_bit_count: usize, salt: []const u8) ![]const u8 {}
 
     /// Verifies a PSS signature.
     ///
     /// Digest must be the result of hashing the input message using Sha256.
     pub fn verify(gpa: *Allocator, pub_key: PublicKey, digest: []const u8, signature: []const u8) !bool {
+        _ = digest;
         if (pub_key.size() != signature.len) return false;
 
         const limb_len = std.math.divCeil(usize, signature.len, @sizeOf(usize)) catch unreachable;
@@ -240,4 +246,121 @@ fn isProbablyPrime(prime: *big_int.Managed, n: usize) bool {
         },
         else => unreachable,
     }
+
+    if (r_a % 3 == 0 or r_a % 5 == 0 or r_a % 7 == 0 or r_a % 11 == 0 or r_a % 13 == 0 or
+        r_a % 17 == 0 or r_a % 19 == 0 or r_a % 23 == 0 or r_a % 37 == 0 or r_b % 29 == 0 or
+        r_b % 31 == 0 or r_b % 41 == 0 or r_b % 43 == 0 or r_b % 47 == 0 or r_b % 53 == 0)
+    {
+        return false;
+    }
+
+    return probablyPrimeMillerRabin(n + 1, true);
 }
+
+/// Reports whether `n` passes `reps` rounds of the
+/// Miller-Rabin primality test, using pseudo-randomly chosen bases.
+/// If force2 is `true`, one of the rounds is forced to use base 2.
+///
+/// Source: Handbook of Applied Cryptography, p. 139, Algorithm 4.24.
+fn probablyPrimeMillerRabin(num: *big_int.Managed, reps: usize, force2: bool) bool {
+    _ = force2;
+    _ = reps;
+    var nm1 = try big_int.Managed.init(num.allocator);
+    defer nm1.deinit();
+
+    try nm1.sub(num.toConst(), nat_one);
+    // determine q, k such that nm1 = q << k
+    const k = trailingZeroBits(nm1);
+    var q = try big_int.Managed.init(num.allocator);
+    defer q.deinit();
+    try q.shiftRight(nm1, k);
+}
+
+fn trailingZeroBits(value: big_int.Managed) usize {
+    if (value.len() == 0) return 0;
+
+    var i: usize = 0;
+    while (value.limbs[i] == 0) {
+        i += 1;
+    }
+
+    return i * @bitSizeOf(usize) + trailingZeros(value.limbs[i]);
+}
+
+fn trailingZeros(value: usize) usize {
+    return switch (@bitSizeOf(value)) {
+        32 => trailingZeros32(@intCast(u32, value)),
+        32 => trailingZeros64(@intCast(u64, value)),
+    };
+}
+
+fn trailingZeros32(value: u32) usize {
+    if (value == 0) return 32;
+    const de_bruijn_32: u32 = 0x077CB531;
+    const de_bruijn_32_tab = [32]u8{
+        0,  1,  28, 2,  29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
+        31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6,  11, 5,  10, 9,
+    };
+    const temp = @intCast(u32, @intCast(i33, value) & -@intCast(i33, value));
+    return de_bruijn_32_tab[temp *% de_bruijn_32 >> (32 - 5)];
+}
+fn trailingZeros64(value: u64) usize {
+    if (value == 0) return 64;
+    const de_bruijn_64 = 0x03f79d71b4ca8b09;
+    const de_bruijn_64_tab = [64]u8{
+        0,  1,  56, 2,  57, 49, 28, 3,  61, 58, 42, 50, 38, 29, 17, 4,
+        62, 47, 59, 36, 45, 43, 51, 22, 53, 39, 33, 30, 24, 18, 12, 5,
+        63, 55, 48, 27, 60, 41, 37, 16, 46, 35, 44, 21, 52, 32, 23, 11,
+        54, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9,  13, 8,  7,  6,
+    };
+    const temp = @intCast(u64, @intCast(i65, value) & -@intCast(i65, value));
+    return de_bruijn_64_tab[temp *% de_bruijn_64 >> (64 - 6)];
+}
+
+test "TrailingZeros" {
+    var tabs: [256]usize = undefined;
+    tabs[0] = 8;
+    for (tabs) |*tab, i| {
+        if (i == 0) continue;
+
+        var x = i;
+        var n: usize = 0;
+        while (x & 1 == 0) {
+            n += 1;
+            x >>= 1;
+        }
+        tab.* = n;
+    }
+
+    for (tabs) |tab, i| {
+        var k: usize = 0;
+        while (k < 64 - 8) : (k += 1) {
+            const x = i << @intCast(u6, k);
+            const expected = tab + k;
+
+            if (x <= 1 << 32 - 1) {
+                var result = trailingZeros32(@intCast(u32, x));
+                if (x == 0) {
+                    try std.testing.expectEqual(@as(usize, 32), result);
+                } else {
+                    try std.testing.expectEqual(expected, result);
+                }
+            }
+
+            if (x <= 1 << 64 - 1) {
+                var result = trailingZeros64(x);
+                if (x == 0) {
+                    try std.testing.expectEqual(@as(usize, 64), result);
+                } else {
+                    try std.testing.expectEqual(expected, result);
+                }
+            }
+        }
+    }
+}
+
+const nat_one: BigInt = blk: {
+    var buf: [1]usize = undefined;
+    const one = big_int.Mutable.init(&buf, 1);
+    break :blk one.toConst();
+};
