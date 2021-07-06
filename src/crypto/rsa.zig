@@ -274,6 +274,56 @@ fn probablyPrimeMillerRabin(num: *big_int.Managed, reps: usize, force2: bool) bo
     var q = try big_int.Managed.init(num.allocator);
     defer q.deinit();
     try q.shiftRight(nm1, k);
+
+    var nm3 = try big_int.Managed.init(num.allocator);
+    defer nm3.deinit();
+    try nm3.sub(nm1, nat_two);
+
+    // var random = std.rand.DefaultPrng.init(num.limbs[0]);
+
+    var x = try big_int.Managed.init(num.allocator);
+    defer x.deinit();
+    var y = try big_int.Managed.init(num.allocator);
+    defer y.deinit();
+    var quotient = try big_int.Managed.init(num.allocator);
+    defer quotient.deinit();
+
+    // next_random: {
+    //     var i: usize = 0;
+    //     while (i < reps) : (i += 1) {
+    //         if (i == reps - 1 and force2) {
+    //             x.copy(nat_two);
+    //         } else {
+    //             random.random.bytes(&x.limbs);
+    //             x.add(x.toConst(), nat_two);
+    //         }
+    //     }
+    // }
+}
+
+fn expNN(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int.Managed) !void {
+    if (m.len() == 1 and m.limbs[0] == 1) {
+        z.set(@as(usize, 0));
+        return;
+    }
+
+    if (y.len() == 0) {
+        z.set(@as(usize, 1));
+        return;
+    }
+
+    if (y.len() == 1 and y.limbs[0] == 1 and m.len() != 0) {
+        var r = try big_int.Managed.init();
+        defer r.deinit();
+        z.divFloor(&r, x.toConst(), m.toConst());
+        return;
+    }
+
+    z.copy(x.toConst());
+
+    if (x.toConst().eq(nat_one) and y.len() > 1 and m.len() > 0) {
+        if (m.limbs[0] & 1 == 1) {}
+    }
 }
 
 fn trailingZeroBits(value: big_int.Managed) usize {
@@ -363,4 +413,19 @@ const nat_one: BigInt = blk: {
     var buf: [1]usize = undefined;
     const one = big_int.Mutable.init(&buf, 1);
     break :blk one.toConst();
+};
+const nat_two: BigInt = blk: {
+    var buf: [1]usize = undefined;
+    const two = big_int.Mutable.init(&buf, 2);
+    break :blk two.toConst();
+};
+const nat_five: BigInt = blk: {
+    var buf: [1]usize = undefined;
+    const five = big_int.Mutable.init(&buf, 5);
+    break :blk five.toConst();
+};
+const nat_ten: BigInt = blk: {
+    var buf: [1]usize = undefined;
+    const ten = big_int.Mutable.init(&buf, 10);
+    break :blk ten.toConst();
 };
