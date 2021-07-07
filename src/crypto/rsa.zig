@@ -14,7 +14,11 @@ pub const PublicKey = struct {
     exponent: usize,
 
     pub fn size(self: PublicKey) usize {
-        return (self.modulus.bitCountAbs() + 7) / 8;
+        return (self.bitCount() + 7) / 8;
+    }
+
+    pub fn bitCount(self: PublicKey) usize {
+        return self.modulus.bitCountAbs();
     }
 };
 
@@ -23,15 +27,27 @@ pub const PrivateKey = struct {
     exponent: big_int.Const,
     primes: []big_int.Const,
 
+    pre_computed: Precomputed,
+
+    const Precomputed = struct {};
+
     pub fn size(self: PrivateKey) usize {
         return self.public_key.size();
     }
 
     pub fn bitCount(self: PrivateKey) usize {
-        return self.public_key.modulus.bitCountAbs();
+        return self.public_key.bitCount();
     }
 
-    // fn decryptAndCheck(self: PrivateKey, c: big_int.Managed) !big_int.Managed {}
+    fn decryptAndCheck(self: PrivateKey, message: big_int.Managed) !big_int.Managed {
+        const decrypted = try self.decrypt(message);
+        _ = decrypted;
+    }
+
+    fn decrypt(self: PrivateKey, message: big_int.Managed) !big_int.Managed {
+        if (self.public_key.modulus[0] == 0) return error.EmptyKey;
+        _ = message;
+    }
 };
 
 /// Generates a multi-prime RSA keypair of the given of the given bit size
@@ -80,6 +96,7 @@ const _Pss = struct {
     /// Calculates the signature of digest using PSS.
     ///
     /// Digest must be the result of hashing the input message using Sha256.
+    /// Memory is owned by the
     pub fn sign(gpa: *Allocator, private_key: PrivateKey, digest: []const u8) ![]const u8 {
         const salt_length = private_key.size() - 2 - Sha256.digest_length;
         const salt = try gpa.alloc(u8, salt_length);
@@ -94,6 +111,7 @@ const _Pss = struct {
             .positive = true,
             .len = em.len,
         };
+
         // we copy the bytes and reverse each individual byte,
         // therefore ptrcast to a many-ptr of T u8.
         mem.copy(u8, @ptrCast([*]u8, mutable.limbs.ptr), signature);
@@ -102,9 +120,11 @@ const _Pss = struct {
         defer managed.deinit();
 
         const checked = try private_key.decryptAndCheck(managed);
-        const s = gpa.alloc(u8, private_key.size());
-        _ = s;
-        _ = checked;
+
+        const buf = @ptrCast([*]u8, checked.limbs.ptr)[0..private_key.size()];
+        mem.reverse(u8, buf);
+
+        return try gpa.resize(buf.ptr[0 .. checked.len() * @sizeOf(usize)], private_key.size());
     }
 
     // fn emsaPssEncode(hashed: []const u8, em_bit_count: usize, salt: []const u8) ![]const u8 {}
@@ -171,12 +191,12 @@ fn calculatePrime(gpa: *Allocator, comptime bits: usize, random: *std.rand.Rando
         const mod = try big_mod.to(u64);
 
         var delta: u64 = 0;
-        next_data: while (delta < 1 << 20) {
+        next_delta: while (delta < 1 << 20) {
             const m = mod + delta;
             for (small_primes) |small_p| {
                 if (m % small_p == 0 and (bits > 6 or m != small_p)) {
                     delta = 0;
-                    continue :next_data;
+                    continue :next_delta;
                 }
 
                 if (delta > 0) {
@@ -186,7 +206,7 @@ fn calculatePrime(gpa: *Allocator, comptime bits: usize, random: *std.rand.Rando
                 break;
             }
 
-            if (probablyPrime(prime, 20) and prime.bitCountAbs() == bits) {
+            if (isProbablyPrime(prime, 20) and prime.bitCountAbs() == bits) {
                 return prime.toConst();
             }
         }
@@ -268,7 +288,7 @@ fn probablyPrimeMillerRabin(num: *big_int.Managed, reps: usize, force2: bool) bo
     var nm1 = try big_int.Managed.init(num.allocator);
     defer nm1.deinit();
 
-    try nm1.sub(num.toConst(), nat_one);
+    try nm1.sub(num.toConst(), constants.one);
     // determine q, k such that nm1 = q << k
     const k = trailingZeroBits(nm1);
     var q = try big_int.Managed.init(num.allocator);
@@ -277,7 +297,7 @@ fn probablyPrimeMillerRabin(num: *big_int.Managed, reps: usize, force2: bool) bo
 
     var nm3 = try big_int.Managed.init(num.allocator);
     defer nm3.deinit();
-    try nm3.sub(nm1, nat_two);
+    try nm3.sub(nm1, constants.two);
 
     // var random = std.rand.DefaultPrng.init(num.limbs[0]);
 
@@ -313,7 +333,7 @@ fn expNN(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int
     }
 
     if (y.len() == 1 and y.limbs[0] == 1 and m.len() != 0) {
-        var r = try big_int.Managed.init();
+        var r = try big_int.Managed.init(z.allocator);
         defer r.deinit();
         z.divFloor(&r, x.toConst(), m.toConst());
         return;
@@ -321,8 +341,39 @@ fn expNN(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int
 
     z.copy(x.toConst());
 
-    if (x.toConst().eq(nat_one) and y.len() > 1 and m.len() > 0) {
+    if (x.toConst().orderAbs(constants.one) == .gt and y.len() > 1 and m.len() > 0) {
         if (m.limbs[0] & 1 == 1) {}
+    }
+
+    var v = y.limbs[y.len() - 1];
+    const shift = leadingZeros(v) + 1;
+    v <<= shift;
+
+    var q = try big_int.Managed.init(z.allocator);
+    defer q.deinit();
+
+    const mask = 1 << (@bitSizeOf(usize) - 1);
+    const w = @bitSizeOf(usize) - shift;
+
+    var zz = try big_int.Managed.init(z.allocator);
+    defer zz.deinit();
+    var r = try big_int.Managed.init(z.allocator);
+    defer r.deinit();
+
+    {
+        var i: usize = 0;
+        while (i < w) : (i += 1) {
+            zz.sqr(z.toConst());
+
+            // swap zz and z
+            for (zz.limbs) |*limb, i| {
+                std.mem.swap(usize, limb, &z.limbs[i]);
+            }
+
+            if (v & mask != 0) {
+                zz.mul(zz.toConst(), x.toConst());
+            }
+        }
     }
 }
 
@@ -340,7 +391,16 @@ fn trailingZeroBits(value: big_int.Managed) usize {
 fn trailingZeros(value: usize) usize {
     return switch (@bitSizeOf(value)) {
         32 => trailingZeros32(@intCast(u32, value)),
-        32 => trailingZeros64(@intCast(u64, value)),
+        64 => trailingZeros64(@intCast(u64, value)),
+        else => unreachable,
+    };
+}
+
+fn leadingZeros(value: usize) usize {
+    return @bitSizeOf(usize) - switch (@bitSizeOf(value)) {
+        32 => leadingZeros32(@intCast(u32, value)),
+        64 => leadingZeros64(@intCast(u64, value)),
+        else => unreachable,
     };
 }
 
@@ -366,6 +426,57 @@ fn trailingZeros64(value: u64) usize {
     const temp = @intCast(u64, @intCast(i65, value) & -@intCast(i65, value));
     return de_bruijn_64_tab[temp *% de_bruijn_64 >> (64 - 6)];
 }
+
+fn leadingZeros32(value: u32) usize {
+    var result: usize = 0;
+    var copy = value;
+    if (copy >= 1 << 16) {
+        copy >>= 16;
+        result = 16;
+    }
+    if (copy >= 1 << 8) {
+        copy >>= 8;
+        result += 8;
+    }
+    return result + len_8_tab[copy];
+}
+
+fn leadingZeros64(value: u64) usize {
+    var result: usize = 0;
+    var copy = value;
+    if (copy >= 1 << 32) {
+        copy >>= 32;
+        result = 32;
+    }
+    if (copy >= 1 << 16) {
+        copy >>= 16;
+        result = 16;
+    }
+    if (copy >= 1 << 8) {
+        copy >>= 8;
+        result += 8;
+    }
+    return result + len_8_tab[copy];
+}
+
+const len_8_tab = [256]u8{
+    0x00, 0x01, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,
+    0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+    0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+};
 
 test "TrailingZeros" {
     var tabs: [256]usize = undefined;
@@ -409,23 +520,25 @@ test "TrailingZeros" {
     }
 }
 
-const nat_one: BigInt = blk: {
-    var buf: [1]usize = undefined;
-    const one = big_int.Mutable.init(&buf, 1);
-    break :blk one.toConst();
-};
-const nat_two: BigInt = blk: {
-    var buf: [1]usize = undefined;
-    const two = big_int.Mutable.init(&buf, 2);
-    break :blk two.toConst();
-};
-const nat_five: BigInt = blk: {
-    var buf: [1]usize = undefined;
-    const five = big_int.Mutable.init(&buf, 5);
-    break :blk five.toConst();
-};
-const nat_ten: BigInt = blk: {
-    var buf: [1]usize = undefined;
-    const ten = big_int.Mutable.init(&buf, 10);
-    break :blk ten.toConst();
+const constants = struct {
+    const one: BigInt = blk: {
+        var buf: [1]usize = undefined;
+        const tmp = big_int.Mutable.init(&buf, 1);
+        break :blk tmp.toConst();
+    };
+    const two: BigInt = blk: {
+        var buf: [1]usize = undefined;
+        const tmp = big_int.Mutable.init(&buf, 2);
+        break :blk tmp.toConst();
+    };
+    const five: BigInt = blk: {
+        var buf: [1]usize = undefined;
+        const tmp = big_int.Mutable.init(&buf, 5);
+        break :blk tmp.toConst();
+    };
+    const ten: BigInt = blk: {
+        var buf: [1]usize = undefined;
+        const tmp = big_int.Mutable.init(&buf, 10);
+        break :blk tmp.toConst();
+    };
 };
