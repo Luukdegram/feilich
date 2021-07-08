@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const mem = std.mem;
 
+const Sha521 = crypto.hash.sha2.Sha512;
 const Sha256 = crypto.hash.sha2.Sha256;
 
 /// Elliptic Curve Digital Signature Algorithm (ECDSA) as specified
@@ -23,13 +24,16 @@ pub const Ecdsa = struct {
     pub const seed_length = 32;
 
     pub const KeyPair = struct {
-        /// Public key component.
-        public_key: [public_length]u8,
         /// Private key component.
-        private_key: [secret_length]u8,
+        d: Curve.Fe,
+
+        /// Public key component x-coordinate.
+        x: Curve.Fe,
+        /// Public key component y-coordinate.
+        y: Curve.Fe,
 
         /// Creates a new key pair using a provided seed or else
-        /// generates a seed.
+        /// generates a new seed and uses that instead.
         pub fn init(maybe_seed: ?[seed_length]u8) !KeyPair {
             const seed = maybe_seed orelse blk: {
                 var random_seed: [seed_length]u8 = undefined;
@@ -38,47 +42,78 @@ pub const Ecdsa = struct {
             };
 
             var pair: KeyPair = undefined;
-            mem.copy(u8, &pair.secret_key, &seed);
-            pair.public_key = try recoverPublicKey(seed);
+            pair.d = Curve.Fe.fromBytes(seed, .Big);
+            // TODO: Verify 'secret_key' does not surpass 'N' (basepoint.z)
+
+            const q = try Curve.basePoint.mul(seed, .Big);
+            pair.x = q.x;
+            pair.y = q.y;
             return pair;
         }
     };
 
-    pub fn recoverPublicKey(secret_key: [secret_length]u8) ![public_length]u8 {
-        // const res = try Curve.basePoint.fromSec1
-    }
+    /// Represents the signature of a message, that was signed using the private key
+    /// of ECDSA using the P256-curve.
+    pub const Signature = struct {
+        /// The r-component of a signature.
+        r: Curve.Fe,
+        /// The s-component of a signature.
+        s: Curve.Fe,
+    };
+
+    // /// Generates a public key using a given `secret_key`.
+    //    pub fn recoverPublicKey(secret_key: [secret_length]u8) ![public_length]u8 {
+    //        const q = try Curve.basePoint.mul(secret_key, .Big);
+    //        return q.toCompressedSec1();
+    //    }
 
     /// Signs a message, using the public key of the given `key_pair`.
-    pub fn sign(key_pair: KeyPair, msg: []const u8) ![]const u8 {
-        // const k = crypto.random.int(usize);
-
+    pub fn sign(key_pair: KeyPair, msg: []const u8) !Signature {
         const entropy = blk: {
             var buf: [seed_length]u8 = undefined;
             crypto.random.bytes(&buf);
             break :blk buf;
         };
 
-        var out: [Sha256.digest_length]u8 = undefined;
-        const hash = Sha256.hash(msg, &out, .{});
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(msg, &digest, .{});
 
-        const N = Curve.basePoint.z.field_order;
-        const H = Curve.scalar.Scalar.fromBytes(hash, .Little);
-        const k = Curve.scalar.random();
+        var md = Sha521.init(.{});
+        md.update(&key_pair.d.toBytes(.Big));
+        md.update(&entropy);
+        md.update(&digest);
 
-        // const R = Curve.basePoint.random
+        var key: [Sha521.digest_length]u8 = undefined;
+        md.final(&key);
 
-        const R = Curve.random();
+        var k: Curve.scalar.CompressedScalar = undefined;
+        var k_inverse: Curve.Fe = undefined;
+        var r: Curve.Fe = undefined;
 
-        //       var hash = Sha256.init(.{});
-        //       hash.update(&key_pair.private_key);
-        //       hash.update(&entropy);
-        //       hash.update(hash);
+        while (true) {
+            while (true) {
+                k = Curve.scalar.random(.Big);
 
-        //       var out: [public_length]u8 = undefined;
-        //       const key = hash.final(&out);
+                k_inverse = k.invert();
 
-        //       const N = Curve.basePoint.z.field_order;
-        // var k: usize = undefind;
+                r = (try Curve.basePoint.mul(k)).x;
+                if (!r.isZero()) {
+                    break;
+                }
+            }
 
+            const e = Curve.scalar.Scalar.fromBytes(key[0..32], .Big);
+            var s = key_pair.d.mul(r);
+            s = s.add(e);
+            s = s.mul(k_inverse);
+            if (!s.isZero()) {
+                break;
+            }
+        }
+
+        return Signature{
+            .r = r,
+            .s = s,
+        };
     }
 };
