@@ -122,6 +122,7 @@ pub const Server = struct {
                                     }
                                 },
                                 .signature_algorithms => |algs| for (algs) |alg| {
+                                    std.log.debug("Alg: {s}\n", .{@tagName(alg)});
                                     if (tls.supported_signature_algorithms.isSupported(alg)) {
                                         chosen_signature = alg;
                                         continue :it_loop;

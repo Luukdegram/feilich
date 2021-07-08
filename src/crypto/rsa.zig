@@ -168,6 +168,7 @@ fn calculatePrime(gpa: *Allocator, comptime bits: usize, random: *std.rand.Rando
     var prime = try big_int.Managed.init(gpa);
 
     var big_mod = try big_int.Managed.initSet(gpa, 0);
+    defer big_mod.deinit();
 
     while (true) {
         random.bytes(&bytes);
@@ -186,13 +187,14 @@ fn calculatePrime(gpa: *Allocator, comptime bits: usize, random: *std.rand.Rando
         const limb_len = std.math.divCeil(usize, bytes.len, @sizeOf(usize)) catch unreachable;
         prime.limbs = @ptrCast([]usize, bytes[0..limb_len]);
 
-        mod(big_mod, small_primes_product);
+        llmod(big_mod, small_primes_product);
 
         const mod = try big_mod.to(u64);
+        _ = mod;
 
         var delta: u64 = 0;
         next_delta: while (delta < 1 << 20) {
-            const m = mod + delta;
+            const m = llmod + delta;
             for (small_primes) |small_p| {
                 if (m % small_p == 0 and (bits > 6 or m != small_p)) {
                     delta = 0;
@@ -224,7 +226,7 @@ const small_primes = [_]u8{
     3, 5, 7, 11, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
 };
 
-fn mod(result: *big_int.Managed, other: BigInt) !void {
+fn llmod(result: *big_int.Managed, other: BigInt) !void {
     var tmp = try big_int.Managed.init(result.allocator);
     defer tmp.deinit();
 
@@ -343,6 +345,7 @@ fn expNN(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int
 
     if (x.toConst().orderAbs(constants.one) == .gt and y.len() > 1 and m.len() > 0) {
         if (m.limbs[0] & 1 == 1) {}
+        // TODO
     }
 
     var v = y.limbs[y.len() - 1];
@@ -364,16 +367,131 @@ fn expNN(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int
         var i: usize = 0;
         while (i < w) : (i += 1) {
             zz.sqr(z.toConst());
-
-            // swap zz and z
-            for (zz.limbs) |*limb, i| {
-                std.mem.swap(usize, limb, &z.limbs[i]);
-            }
+            swapBigInts(zz, z);
 
             if (v & mask != 0) {
                 zz.mul(zz.toConst(), x.toConst());
+                swapBigInts(zz, z);
             }
+
+            if (m.len() != 0) {
+                zz.divFloor(r, z.toConst(), m.toConst());
+                swapBigInts(zz, q);
+                swapBigInts(r, z);
+            }
+
+            v <<= 1;
         }
+    }
+
+    {
+        var i = y.len() - 2;
+        while (i >= 0) : (i -= 1) {
+            v = y.limbs[i];
+            var j: usize = 0;
+            while (j < @bitSizeOf(usize)) : (j += 1) {
+                zz.sqr(z.toConst());
+                swapBigInts(zz, z);
+            }
+
+            if (v & mask != 0) {
+                zz.mul(z.toConst(), x.toConst());
+                swapBigInts(zz, z);
+            }
+
+            if (m.len() != 0) {
+                zz.divFloor(r, z.toConst(), m.toConst());
+                swapBigInts(zz, q);
+                swapBigInts(r, z);
+            }
+
+            v <<= 1;
+        }
+    }
+
+    return z.normalize(z.len());
+}
+
+/// Calculates x**y mod m using a fixed, 4-bit window.
+/// Uses the Montgomery respresentation.
+///
+/// Original implementation from Go's std:
+/// https://golang.org/src/math/big/nat.go#L1386
+fn expNNMontgomery(z: *big_int.Managed, x: *big_int.Managed, y: big_int.Managed, m: big_int.Managed) !void {
+    const len = m.len();
+    _ = y;
+
+    if (x.len() > len) {
+        var r = try big_int.Managed.init(z.allocator);
+        defer r.deinit();
+        r.divFloor(x, x.toConst(), m.toConst());
+    }
+
+    if (x.len() < len) {
+        var rr = try big_int.Managed.init(z.allocator);
+        defer rr.deinit();
+        rr.copy(x);
+        swapBigInts(x, rr);
+    }
+
+    var k0 = 2 - m.limbs[0];
+    var t = m.limbs[0] - 1;
+    {
+        var i: usize = 1;
+        while (i < @bitSizeOf(usize)) : (i <<= 1) {
+            t *= t;
+            k0 *= (t + 1);
+        }
+    }
+    var k1 = std.math.negateCast(k0);
+    // set k0 to undefined to ensure we do not re-use it.
+    k0 = undefined;
+
+    var RR = try big_int.Managed.initSet(z.allocator, 2);
+    defer RR.deinit();
+    var zz = try big_int.Managed.init(z.allocator);
+    defer zz.deinit();
+    zz.shiftLeft(RR, 2 * len * @bitSizeOf(usize));
+    {
+        var r = try big_int.Managed.init(z.allocator);
+        defer r.deinit();
+        r.divFloor(&RR, zz.toConst(), m.toConst());
+    }
+
+    if (RR.len() < len) {
+        zz.copy(RR.toConst());
+        RR = ZZ;
+    }
+
+    var one = try big_int.Managed.initCapacity(z.allocator, len);
+    defer one.deinit();
+    one.limbs[0] = 1;
+
+    const n = 4;
+    var powers: [1 << n]usize = undefined;
+    powers[0] = try big_int.Managed.init(z.allocator);
+    defer powers[0].deinit();
+    montgomery(&powers[0], one, RR, m, k1, len);
+}
+
+fn montgomery(z: *big_int.Managed, x: big_int.Managed, y: big_int.Managed, m: big_int.Managed, k: usize, n: usize) !void {
+    std.debug.assert(x.len() == n and y.len() == n and m.len() == n);
+    try z.ensureAddCapacity(n * 2);
+    mem.set(usize, z.limbs, 0);
+    _ = k;
+
+    // var c: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (n += 1) {
+        // const d = y.limbs[i];
+    }
+}
+
+/// Swaps the values of BigInts. Asserts the length are equal.
+fn swapBigInts(a: big_int.Managed, b: big_int.Managed) void {
+    std.debug.assert(a.len() == b.len());
+    for (a.limbs) |*limb, i| {
+        mem.swap(usize, limb, &b.limbs[i]);
     }
 }
 
