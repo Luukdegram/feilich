@@ -281,12 +281,19 @@ pub const RecordBuilder = struct {
         end: void,
     },
 
+    /// No errors can occur when writing to the internal
+    /// buffer as it's safety checked during release-safe and debug modes.
+    ///
+    /// Any panics are caused by a developer of the library, not by user-code.
     const Error = error{};
 
     pub fn init() RecordBuilder {
         return .{ .buffer = undefined, .index = 0, .state = .end };
     }
 
+    /// Initializes a new Handshake record of type `HandshakeType`.
+    /// It sets an inner state and saves the location where the result length
+    /// will be written to.
     pub fn startRecord(self: *RecordBuilder, rec: HandshakeType) void {
         std.debug.assert(self.state == .end);
         self.buffer[self.index] = rec.int();
@@ -294,6 +301,8 @@ pub const RecordBuilder = struct {
         self.index += 4; // 3 bytes for the length we will write later
     }
 
+    /// Ends the current Handshake record (NOT the total record), updates the state
+    /// and writes the written length to the handshake record.
     pub fn endRecord(self: *RecordBuilder) void {
         std.debug.assert(self.state == .start);
         defer self.state = .end;
@@ -302,17 +311,30 @@ pub const RecordBuilder = struct {
         std.mem.writeIntBig(u24, self.buffer[idx..][0..3], len);
     }
 
+    /// Writes to the internal buffer, asserting a handshake record was set.
+    /// Updates the internal index on each write and returns the length that
+    /// was written to the internal buffer.
     fn write(self: *RecordBuilder, bytes: []const u8) Error!usize {
+        std.debug.assert(self.state == .start); // it's illegal to write random data without creating a record type first.
         mem.copy(u8, self.buffer[self.index..], bytes);
         self.index += @intCast(u14, bytes.len);
         return bytes.len;
     }
 
+    /// Initializes a `std.io.Writer` that allows writing data to a handshake record
+    /// without requiring any allocations.
+    ///
+    /// It is illegal to write to this without calling `startRecord` first.
     pub fn writer(self: *RecordBuilder) std.io.Writer(*RecordBuilder, Error, write) {
         return .{ .context = self };
     }
 
     /// Writes a new Record to a given writer using a given `tag` of `tls.Record.RecordType`.
+    /// Writes the total length written to this buffer as part of the Record.
+    ///
+    /// Asserts a started handshake record was ended before calling this.
+    ///
+    /// This does not reset the internal buffer. For that, use `reset()`.
     pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype) @TypeOf(any_writer).Error!void {
         std.debug.assert(self.state == .end);
         const total_len = self.index;
@@ -322,6 +344,8 @@ pub const RecordBuilder = struct {
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.
+    ///
+    /// Asserts no handshake record is being written currently.
     pub fn reset(self: *RecordBuilder) void {
         std.debug.assert(self.state == .end); // resetting during a record write is not allowed.
         self.index = 0;
