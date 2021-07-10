@@ -28,6 +28,28 @@ pub const HandshakeType = enum(u8) {
     }
 };
 
+/// Handshake-specific header record type
+pub const HandshakeHeader = struct {
+    handshake_type: HandshakeType,
+    length: u16,
+
+    /// Converts the header into bytes
+    pub fn toBytes(self: HandshakeHeader) [3]u8 {
+        var buf: [3]u8 = undefined;
+        buf[0] = self.handshake_type.int();
+        mem.writeIntBig(16, buf[1..3], self.length);
+        return buf;
+    }
+
+    /// Constructs a HandshakeHeader from an array of bytes
+    pub fn fromBytes(bytes: [3]u8) HandshakeHeader {
+        return .{
+            .handshake_type = @intToEnum(HandshakeType, bytes[0]),
+            .length = mem.readIntBig(u16, bytes[1..3]),
+        };
+    }
+};
+
 pub const ReadError = error{
     /// Reached end of stream, perhaps the client disconnected.
     EndOfStream,
@@ -247,6 +269,65 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
     };
 }
 
+/// Constructs a new record to be sent to the client
+/// for the handshake process. Contains an internal
+/// buffer so we can calculate the total length required
+/// to parse the entire content.
+pub const RecordBuilder = struct {
+    buffer: [1 << 14]u8,
+    index: u14,
+    state: union(enum) {
+        start: u14,
+        end: void,
+    },
+
+    const Error = error{};
+
+    pub fn init() RecordBuilder {
+        return .{ .buffer = undefined, .index = 0, .state = .end };
+    }
+
+    pub fn startRecord(self: *RecordBuilder, rec: HandshakeType) void {
+        std.debug.assert(self.state == .end);
+        self.buffer[self.index] = rec.int();
+        self.state = .{ .start = self.index + 1 };
+        self.index += 4; // 3 bytes for the length we will write later
+    }
+
+    pub fn endRecord(self: *RecordBuilder) void {
+        std.debug.assert(self.state == .start);
+        defer self.state = .end;
+        const idx = self.state.start;
+        const len = self.index - idx - 3; // 3 bytes for writing the index
+        std.mem.writeIntBig(u24, self.buffer[idx..][0..3], len);
+    }
+
+    fn write(self: *RecordBuilder, bytes: []const u8) Error!usize {
+        mem.copy(u8, self.buffer[self.index..], bytes);
+        self.index += @intCast(u14, bytes.len);
+        return bytes.len;
+    }
+
+    pub fn writer(self: *RecordBuilder) std.io.Writer(*RecordBuilder, Error, write) {
+        return .{ .context = self };
+    }
+
+    /// Writes a new Record to a given writer using a given `tag` of `tls.Record.RecordType`.
+    pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype) @TypeOf(any_writer).Error!void {
+        std.debug.assert(self.state == .end);
+        const total_len = self.index;
+        var record = tls.Record.init(tag, total_len);
+        try record.writeTo(any_writer);
+        try any_writer.writeAll(self.buffer[0..self.index]);
+    }
+
+    /// Resets the internal buffer's index to 0 so we can build a new record.
+    pub fn reset(self: *RecordBuilder) void {
+        std.debug.assert(self.state == .end); // resetting during a record write is not allowed.
+        self.index = 0;
+    }
+};
+
 /// Constructs a reader that hashes each read's content
 /// NOTE: It reads raw data, not hashed data.
 fn HashReader(comptime ReaderType: type) type {
@@ -385,4 +466,36 @@ test "Client Hello" {
     var cipher_bytes = [_]u8{ 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 };
     const ciphers = tls.bytesToTypedSlice(tls.CipherSuite, &cipher_bytes);
     try std.testing.expectEqualSlices(tls.CipherSuite, ciphers, client_hello.cipher_suites);
+}
+
+test "RecordBuilder" {
+    const finished_bytes = [_]u8{
+        0xea, 0x6e, 0xe1, 0x76, 0xdc, 0xcc, 0x4a, 0xf1, 0x85, 0x9e, 0x9e, 0x4e, 0x93, 0xf7, 0x97, 0xea,
+        0xc9, 0xa7, 0x8c, 0xe4, 0x39, 0x30, 0x1e, 0x35, 0x27, 0x5a, 0xd4, 0x3f, 0x3c, 0xdd, 0xbd, 0xe3,
+    };
+    var buf: [1 << 14]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+    var builder = RecordBuilder.init();
+    builder.startRecord(.finished);
+    builder.writer().writeAll(&finished_bytes) catch unreachable;
+    builder.endRecord();
+    try builder.writeRecord(.application_data, writer);
+
+    // zig fmt: off
+    try std.testing.expectEqualSlices(u8, &([_]u8{
+        // application data
+        0x17,
+        // Tls version
+        0x03, 0x03,
+        // length
+        0x00, 0x24,
+        // finished handshake header type
+        0x14,
+        // handshake header length
+        0x00, 0x00, 0x20,
+        // actual finished bytes
+    } ++ finished_bytes),
+    stream.getWritten());
+    // zig fmt: on
 }
