@@ -193,6 +193,7 @@ pub const supported_signature_algorithms = struct {
 };
 
 /// Supported cipher suites by TLS 1.3
+/// https://datatracker.ietf.org/doc/html/rfc8446#appendix-B.4
 pub const CipherSuite = enum(u16) {
     tls_aes_128_gcm_sha256 = 0x1301,
     tls_aes_256_gcm_sha384 = 0x1302,
@@ -202,6 +203,12 @@ pub const CipherSuite = enum(u16) {
 
     pub fn int(self: CipherSuite) u16 {
         return @enumToInt(self);
+    }
+
+    /// Returns a `Cipher` from the given `CipherSuite`,
+    /// used to encrypt TLS data before sending it to the peer.
+    pub fn cipher(self: CipherSuite) Cipher {
+        return ciphers.fromSuite(self);
     }
 };
 
@@ -510,7 +517,7 @@ pub const KeyExchange = struct {
 pub const Curve = struct {
     /// Error which can occur when generating the public key
     pub const Error = crypto.errors.IdentityElementError;
-    genFn: fn (self: *Curve, private_key: [32]u8, public_key_out: *[32]u8) Error!void,
+    genFn: fn (*Curve, [32]u8, *[32]u8) Error!void,
 
     /// Generates a new public key from a given private key.
     /// Writes the output of the curve function to `public_key_out`.
@@ -532,6 +539,76 @@ pub const curves = struct {
     };
     /// Provides a x25519 elliptic curve to construct a private/public key-pair.
     pub const x25519 = &_x25519.state;
+
+    /// From a given `NamedGroup` returns a `Curve`, used to generate
+    /// a KeyExchange containing a public and private key component.
+    pub fn fromNamedGroup(group: NamedGroup) *Curve {
+        return switch (group) {
+            .x25519 => x25519,
+            else => @panic("TODO: Implement more curves"),
+        };
+    }
+};
+
+/// Ciphers are used to encrypt data during
+/// the TLS handshake process.
+pub const Cipher = struct {
+    const tag_length = 16;
+    const nonce_length = 12;
+    const key_len = 32;
+
+    encryptFn: fn (
+        *Cipher,
+        []u8,
+        *[tag_length]u8,
+        []const u8,
+        []const u8,
+        [nonce_length]u8,
+        [key_len]u8,
+    ) void,
+
+    pub fn encrypt(
+        self: *Cipher,
+        buf: []u8,
+        auth_tag: *[tag_length]u8,
+        msg: []const u8,
+        ad: []const u8,
+        nonce: [nonce_length]u8,
+        key: [key_len]u8,
+    ) void {
+        self.encryptFn(self, buf, auth_tag, msg, ad, nonce, key);
+    }
+};
+
+pub const ciphers = struct {
+    const _aes256 = struct {
+        var state = Cipher{ .encryptFn = encrypt };
+        const Aes256 = crypto.aead.aes_gcm.Aes256Gcm;
+
+        fn encrypt(
+            cipher: *Cipher,
+            /// A buffer which size is big enough to contain `msg`
+            buf: []u8,
+            auth_tag: *[Aes256.tag_length]u8,
+            /// The actual message to encrypt
+            msg: []const u8,
+            ad: []const u8,
+            nonce: [Aes256.nonce_length]u8,
+            key: [Aes256.key_length]u8,
+        ) void {
+            _ = cipher;
+            Aes256.encrypt(buf, auth_tag, msg, ad, nonce, key);
+        }
+    };
+    pub const aes256Gcm = &_aes256.state;
+
+    /// Returns a `Cipher` from a given `CipherSuite`
+    pub fn fromSuite(suite: CipherSuite) Cipher {
+        return switch (suite) {
+            .tls_aes_128_gcm_sha256 => aes256Gcm,
+            else => @panic("TODO: Implement more cipher suites"),
+        };
+    }
 };
 
 test "x25519 curve" {
