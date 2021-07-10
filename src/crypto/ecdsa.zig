@@ -66,9 +66,9 @@ pub const KeyPair = struct {
 /// of ECDSA using the P256-curve.
 pub const Signature = struct {
     /// The r-component of a signature.
-    r: Curve.Fe,
+    r: [32]u8,
     /// The s-component of a signature.
-    s: Curve.Fe,
+    s: [32]u8,
 };
 
 /// Signs a message, using the public key of the given `key_pair`.
@@ -110,8 +110,26 @@ pub fn sign(key_pair: KeyPair, msg: []const u8) !Signature {
     };
 }
 
-/// Verifies a signature of the digest using a given `public_key`
-pub fn verify(public_key: KeyPair.PublicKey, digest: [Sha256.digest_length]u8, signature: Signature) !bool {}
+/// Verifies a signature of the hash using a given `public_key`
+pub fn verify(public_key: KeyPair.PublicKey, hash: [Sha256.digest_length]u8, signature: Signature) !bool {
+    const s = try Curve.Fe.fromBytes(signature.s, .Big);
+    const r = try Curve.Fe.fromBytes(signature.r, .Big);
+    const z = try Curve.Fe.fromBytes(hash, .Big);
+
+    const s_inv = s.invert();
+    const u_1 = z.mul(s_inv);
+    const u_2 = r.mul(s_inv);
+
+    const Q = try Curve.fromAffineCoordinates(.{ .x = public_key.x, .y = public_key.y });
+    const x = (try Curve.basePoint.mulDoubleBasePublic(
+        u_1.toBytes(.Big),
+        Q,
+        u_2.toBytes(.Big),
+        .Big,
+    )).affineCoordinates().x;
+
+    return x.equivalent(r);
+}
 
 test "KeyPair - eql" {
     var key_pair = try KeyPair.init(null);
@@ -151,15 +169,11 @@ test "verify" {
     };
 
     var pub_key = KeyPair.PublicKey{
-        .x = try Curve.Fe.fromBytes(Qx, .Little),
-        .y = try Curve.Fe.fromBytes(Qy, .Little),
+        .x = try Curve.Fe.fromBytes(Qx, .Big),
+        .y = try Curve.Fe.fromBytes(Qy, .Big),
     };
 
     var hashed: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(&msg, &hashed, .{});
-    var sig = Signature{
-        .r = try Curve.Fe.fromBytes(R, .Little),
-        .s = try Curve.Fe.fromBytes(S, .Little),
-    };
-    try std.testing.expect(try verify(pub_key, hashed, sig));
+    try std.testing.expect(try verify(pub_key, hashed, .{ .r = R, .s = S }));
 }
