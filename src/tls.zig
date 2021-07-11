@@ -174,6 +174,10 @@ pub const SignatureAlgorithm = enum(u16) {
 
     /// Reserved Code Points
     _,
+
+    pub fn int(self: SignatureAlgorithm) u16 {
+        return @enumToInt(self);
+    }
 };
 
 /// Table of supported `SignatureAlgorithm` of this library

@@ -206,14 +206,10 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             /// on the client's Key Share.
             key_share: tls.KeyShare,
         ) Error!void {
-            const writer = self.writer.writer();
+            var builder = RecordBuilder.init();
+            builder.startMessage(.server_hello);
+            const writer = builder.writer();
             try writer.writeByte(HandshakeType.server_hello.int());
-
-            // The total amount of bytes the client must read to decode the
-            // entire 'server hello' message.
-            // TODO: byteLen returns the full length, but when `kind` is `retry_request`
-            // we will only send the `named_group`, and not the key exchange.
-            try writer.writeIntBig(u16, 76 + key_share.byteLen());
 
             // Means TLS 1.2, this is legacy and actual version is sent through extensions
             try writer.writeIntBig(u16, 0x303);
@@ -265,6 +261,65 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 0x03, 0x04,
             };
             try writer.writeAll(supported_versions);
+
+            builder.endMessage();
+            try builder.writeRecord(.handshake, self.writer.writer());
+        }
+
+        /// Sends the remaining messages required to finish the handshake.
+        /// Wraps all messages and encrypts them, using the provided Cipher.
+        pub fn handshakeFinish(self: *Self, server_secret: [32]u8, certificate: []const u8, cipher: *tls.Cipher) !void {
+            var builder = RecordBuilder.init();
+            const builder_writer = builder.writer();
+            // encrypted extensions
+            builder.startMessage(.encrypted_extensions);
+            builder_writer.writeAll(&.{ 0x00, 0x00 }) catch unreachable;
+            builder.endMessage();
+
+            // Certificate
+            builder.startMessage(.certificate);
+            builder_writer.writeByte(0x00); // request context
+            // Full length of all certificates
+            // For now, only support a single one
+            // 5 extra bytes as we write the length of the first
+            // certificate once more, and the certificate extensions.
+            builder_writer.writeIntBig(u24, @intCast(u24, certificate.len + 5));
+            builder_writer.writeIntBig(u24, @intCast(u23, certificate.len));
+            builder_writer.writeAll(certificate);
+            builder_writer.writeAll(&.{ 0x00, 0x00 }); // no extensions
+            builder.endMessage();
+
+            // Certificate verify
+            builder.startMessage(.certificate_verify);
+            builder_writer.writeIntBig(u16, signature.int());
+            // TODO write the actual signature
+            // For this we need ECDSA
+            builder.endMessage();
+
+            // handshake finished type
+            builder.startMessage(.finished);
+            const verify_data: [32]u8 = blk: {
+                const finished_key = tls.hkdfExpandLabel(server_secret, "finished", "", 32);
+                // copy hasher
+                const finished_hash: [32]u8 = hsh: {
+                    var temp_hasher = self.writer.context.hash;
+                    var buf: [32]u8 = undefined;
+                    // add the data between server hello and cert verify
+                    // Will not include the `finished` message.
+                    temp_hasher.update(builder.toSlice());
+                    temp_hasher.final(&buf);
+                    break :hsh buf;
+                };
+
+                var out: [32]u8 = undefined;
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&out, finished_key, finished_hash);
+                break :blk out;
+            };
+            builder_writer.writeAll(&verify_data);
+            builder.endMessage();
+
+            // write directly to the writer as we do not need to hash it again.
+            try builder.writeRecord(.application_data, self.writer.context.writer, .{ .cipher = cipher });
         }
     };
 }
@@ -291,19 +346,19 @@ pub const RecordBuilder = struct {
         return .{ .buffer = undefined, .index = 0, .state = .end };
     }
 
-    /// Initializes a new Handshake record of type `HandshakeType`.
+    /// Initializes a new Handshake message of type `HandshakeType`.
     /// It sets an inner state and saves the location where the result length
     /// will be written to.
-    pub fn startRecord(self: *RecordBuilder, rec: HandshakeType) void {
+    pub fn startMessage(self: *RecordBuilder, rec: HandshakeType) void {
         std.debug.assert(self.state == .end);
         self.buffer[self.index] = rec.int();
         self.state = .{ .start = self.index + 1 };
         self.index += 4; // 3 bytes for the length we will write later
     }
 
-    /// Ends the current Handshake record (NOT the total record), updates the state
+    /// Ends the current Handshake message (NOT the total record), updates the state
     /// and writes the written length to the handshake record.
-    pub fn endRecord(self: *RecordBuilder) void {
+    pub fn endMessage(self: *RecordBuilder) void {
         std.debug.assert(self.state == .start);
         defer self.state = .end;
         const idx = self.state.start;
@@ -335,12 +390,23 @@ pub const RecordBuilder = struct {
     /// Asserts a started handshake record was ended before calling this.
     ///
     /// This does not reset the internal buffer. For that, use `reset()`.
-    pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype) @TypeOf(any_writer).Error!void {
+    ///
+    /// Will used the provided `tls.Cipher` when the tag of `encryption` is set to `cipher`, to encrypt
+    /// the data before writing it.
+    pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype, encryption: union(enum) {
+        none: void,
+        cipher: *tls.Cipher,
+    }) @TypeOf(any_writer).Error!void {
         std.debug.assert(self.state == .end);
-        const total_len = self.index;
-        var record = tls.Record.init(tag, total_len);
+        const application_data = switch (encryption) {
+            .none => self.toSlice(),
+            .cipher => |cipher| try cipher.encrypt(),
+        };
+
+        var record = tls.Record.init(tag, application_data.len);
         try record.writeTo(any_writer);
-        try any_writer.writeAll(self.buffer[0..self.index]);
+
+        try any_writer.writeAll(application_data);
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.
@@ -349,6 +415,18 @@ pub const RecordBuilder = struct {
     pub fn reset(self: *RecordBuilder) void {
         std.debug.assert(self.state == .end); // resetting during a record write is not allowed.
         self.index = 0;
+    }
+
+    /// Returns a slice of the current internal buffer.
+    ///
+    /// When we are still writing to a handshake message, this will return a
+    /// slice until the start of that record as it assumes the slice is needed
+    /// unside the record.
+    pub fn toSlice(self: RecordBuilder) []const u8 {
+        return switch (self.state) {
+            .start => |idx| self.buffer[0..idx],
+            .end => self.buffer[0..self.index],
+        };
     }
 };
 

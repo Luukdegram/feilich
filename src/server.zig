@@ -161,17 +161,11 @@ pub const Server = struct {
                         try writeAlert(.fatal, .handshake_failure, writer);
                         return error.UnsupportedNamedGroup;
                     };
-                    std.debug.print("Key share: {s}\n-------\n{s}\n----\n", .{
-                        @tagName(client_key_share.named_group),
-                        &client_key_share.key_exchange,
-                    });
 
-                    // ignore for now
-                    // signature = chosen_signature orelse {
-                    //     try writeAlert(.fatal, .handshake_failure, writer);
-                    //     return error.UnsupportedSignatureAlgorithm;
-                    // };
-                    _ = signature;
+                    signature = chosen_signature orelse {
+                        try writeAlert(.fatal, .handshake_failure, writer);
+                        return error.UnsupportedSignatureAlgorithm;
+                    };
 
                     server_key_share = blk: {
                         const group = chosen_group orelse {
@@ -247,12 +241,13 @@ pub const Server = struct {
             break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
         };
 
-        try tls.Record.init(.application_data, 0x0475).writeTo(writer);
-
         _ = client_handshake_iv;
         _ = server_handshake_iv;
         _ = client_handshake_key;
         _ = server_handshake_key;
+
+        // -- Write the encrypted message that wraps multiple handshake headers -- //
+        try handshake_writer.handshakeFinish();
     }
 
     /// Constructs an alert record and writes it to the client's connection.
