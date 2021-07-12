@@ -52,54 +52,153 @@ pub const Record = extern struct {
             .len = try reader.readIntBig(u16),
         };
     }
-};
 
-/// Types of alerts we can emit or receive
-/// Known as AlertDescription by TLS
-pub const Alert = enum(u8) {
-    close_notify = 0,
-    unexpected_message = 10,
-    bad_record_mac = 20,
-    record_overflow = 22,
-    handshake_failure = 40,
-    bad_certificate = 42,
-    unsupported_certificate = 43,
-    certificate_revoked = 44,
-    certificate_expired = 45,
-    certificate_unknown = 46,
-    illegal_parameter = 47,
-    unknown_ca = 48,
-    access_denied = 49,
-    decode_error = 50,
-    decrypt_error = 51,
-    protocol_version = 70,
-    insufficient_security = 71,
-    internal_error = 80,
-    inappropriate_fallback = 86,
-    user_canceled = 90,
-    missing_extension = 109,
-    unsupported_extension = 110,
-    unrecognized_name = 112,
-    bad_certificate_status_response = 113,
-    unknown_psk_identity = 115,
-    certificate_required = 116,
-    no_application_protocol = 120,
-
-    pub fn int(self: Alert) u8 {
-        return @enumToInt(self);
+    /// Represents a `Record` as an array
+    pub fn toBytes(self: Record) [5]u8 {
+        var bytes: [5]u8 = undefined;
+        bytes[0] = @enumToInt(self.record_type);
+        mem.writeIntBig(u16, bytes[1..3], self.protocol_version);
+        mem.writeIntBig(u16, bytes[3..5], self.len);
+        return bytes;
     }
 };
 
-/// Represents the severity of the alert.
-/// When the level is `fatal`, no more data must be read
-/// or written to the connection.
-pub const AlertLevel = enum(u8) {
-    warning = 1,
-    fatal = 2,
+pub const Alert = struct {
+    severity: Severity,
+    tag: Tag,
 
-    pub fn int(self: AlertLevel) u8 {
-        return @enumToInt(self);
+    /// Initializes a new `Alert` of a given type `Tag` with its severity set
+    /// to `severity`.
+    pub fn init(tag: Tag, severity: Severity) Alert {
+        return .{ .tag = tag, .severity = severity };
     }
+
+    /// Reads an alert from a given `reader`
+    pub fn readFrom(reader: anytype) @TypeOf(reader).Error!Alert {
+        return Alert{
+            .severity = @intToEnum(Severity, try reader.readByte()),
+            .tag = @intToEnum(Tag, try reader.readByte()),
+        };
+    }
+
+    /// Writes the Alert to a given `writer` stream.
+    pub fn writeTo(self: Alert, writer: anytype) @TypeOf(writer)!void {
+        try writer.write(self.severity.int());
+        try writer.write(self.tag.int());
+    }
+
+    /// Returns the `Tag` of an `Alert` as an `Error`. Can be used
+    /// inside functions that receive an alert as response from the peer.
+    pub fn toError(self: Alert) Error {
+        return switch (self.tag) {
+            .close_notify => error.CloseNotify,
+            .unexpected_message => error.UnexpectedMessage,
+            .bad_record_mac => error.BadRecordMac,
+            .record_overflow => error.RecordOverflow,
+            .handshake_failure => error.HandshakeFailure,
+            .bad_certificate => error.BadCertificate,
+            .unsupported_certificate => error.UnsupportedCertificate,
+            .certificate_revoked => error.CertificateRevoked,
+            .certificate_expired => error.CertificateExpired,
+            .certificate_unknown => error.CertificateUnknown,
+            .illegal_parameter => error.IllegalParameter,
+            .unknown_ca => error.UnknownCA,
+            .access_denied => error.AccessDenied,
+            .decode_error => error.DecodeError,
+            .decrypt_error => error.DecryptError,
+            .protocol_version => error.ProtocolVersion,
+            .insufficient_security => error.InsufficientSecurity,
+            .internal_error => error.InternalError,
+            .inappropriate_fallback => error.InappropiateFallback,
+            .user_canceled => error.UserCanceled,
+            .missing_extension => error.MissingExtension,
+            .unsupported_extension => error.UnsupportedExtension,
+            .unrecognized_name => error.UnrecognizedName,
+            .bad_certificate_status_response => error.BadCertificateStatusResponse,
+            .unknown_psk_identity => error.UnknownPskIdentity,
+            .certificate_required => error.CertificateRequired,
+            .no_application_protocol => error.NoApplicationProtocol,
+        };
+    }
+
+    /// Types of alerts we can emit or receive
+    /// Known as AlertDescription by TLS
+    pub const Tag = enum(u8) {
+        close_notify = 0,
+        unexpected_message = 10,
+        bad_record_mac = 20,
+        record_overflow = 22,
+        handshake_failure = 40,
+        bad_certificate = 42,
+        unsupported_certificate = 43,
+        certificate_revoked = 44,
+        certificate_expired = 45,
+        certificate_unknown = 46,
+        illegal_parameter = 47,
+        unknown_ca = 48,
+        access_denied = 49,
+        decode_error = 50,
+        decrypt_error = 51,
+        protocol_version = 70,
+        insufficient_security = 71,
+        internal_error = 80,
+        inappropriate_fallback = 86,
+        user_canceled = 90,
+        missing_extension = 109,
+        unsupported_extension = 110,
+        unrecognized_name = 112,
+        bad_certificate_status_response = 113,
+        unknown_psk_identity = 115,
+        certificate_required = 116,
+        no_application_protocol = 120,
+
+        pub fn int(self: Alert) u8 {
+            return @enumToInt(self);
+        }
+    };
+
+    /// Represents the severity of the alert.
+    /// When the level is `fatal`, no more data must be read
+    /// or written to the connection.
+    pub const Severity = enum(u8) {
+        warning = 1,
+        fatal = 2,
+
+        pub fn int(self: AlertLevel) u8 {
+            return @enumToInt(self);
+        }
+    };
+
+    /// All alert errors/warnings specified by RFC 8446
+    pub const Error = error{
+        CloseNotify,
+        UnexpectedMessage,
+        BadRecordMac,
+        RecordOverflow,
+        HandshakeFailure,
+        BadCertificate,
+        UnsupportedCertificate,
+        CertificateRevoked,
+        CertificateExpired,
+        CertificateUnknown,
+        IllegalParameter,
+        UnknownCA,
+        AccessDenied,
+        DecodeError,
+        DecryptError,
+        ProtocolVersion,
+        InsufficientSecurity,
+        InternalError,
+        InappropiateFallback,
+        UserCanceled,
+        MissingExtension,
+        UnsupportedExtension,
+        UnrecognizedName,
+        BadCertificateStatusResponse,
+        UnknownPskIdentity,
+        CertificateRequired,
+        NoApplicationProtocol,
+    };
 };
 
 /// Represents the key exchange that is supported by the client or server
@@ -557,20 +656,19 @@ pub const curves = struct {
 /// Ciphers are used to encrypt data during
 /// the TLS handshake process.
 pub const Cipher = struct {
+    // TODO: Support different sizes?
     const tag_length = 16;
     const nonce_length = 12;
     const key_len = 32;
 
-    encryptFn: fn (
-        *Cipher,
-        []u8,
-        *[tag_length]u8,
-        []const u8,
-        []const u8,
-        [nonce_length]u8,
-        [key_len]u8,
-    ) void,
+    pub const Error = error{AuthenticationFailed};
 
+    /// Implementation of the encryption function pointer
+    encryptFn: fn (*Cipher, []u8, *[tag_length]u8, []const u8, []const u8, [nonce_length]u8, [key_len]u8) void,
+    /// Implementation of the decryption function pointer
+    decryptFn: fn ([]u8, []u8, [tag_length]u8, []const u8, [nonce_length]u8, [key_len]u8) Error!void,
+
+    /// Encrypts a message using a given Cipher implementation
     pub fn encrypt(
         self: *Cipher,
         buf: []u8,
@@ -581,6 +679,19 @@ pub const Cipher = struct {
         key: [key_len]u8,
     ) void {
         self.encryptFn(self, buf, auth_tag, msg, ad, nonce, key);
+    }
+
+    /// Decrypts a message using a given Cipher implementation
+    pub fn decrypt(
+        self: *Cipher,
+        msg: []u8,
+        buf: []u8,
+        auth_tag: [tag_length]u8,
+        ad: []const u8,
+        nonce: [nonce_length]u8,
+        key: [key_length]u8,
+    ) Cipher.Error!void {
+        return self.decryptFn(self, msg, buf, auth_tag, ad, nonce, key);
     }
 };
 
@@ -602,6 +713,19 @@ pub const ciphers = struct {
         ) void {
             _ = cipher;
             Aes256.encrypt(buf, auth_tag, msg, ad, nonce, key);
+        }
+
+        fn decrypt(
+            cipher: *Cipher,
+            msg: []u8,
+            buf: []u8,
+            auth_tag: [Aes256.tag_length]u8,
+            ad: []const u8,
+            nonce: [Aes256.nonce_length]u8,
+            key: [Aes256.key_length]u8,
+        ) Cipher.Error!void {
+            _ = cipher;
+            try Aes256.decrypt(msg, buf, auth_tag, ad, nonce, key);
         }
     };
     pub const aes256Gcm = &_aes256.state;

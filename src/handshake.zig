@@ -308,11 +308,11 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 const finished_key = tls.hkdfExpandLabel(server_secret, "finished", "", 32);
                 // copy hasher
                 const finished_hash: [32]u8 = hsh: {
+                    self.writer.context.update(builder.toSlice());
                     var temp_hasher = self.writer.context.hash;
                     var buf: [32]u8 = undefined;
                     // add the data between server hello and cert verify
                     // Will not include the `finished` message.
-                    temp_hasher.update(builder.toSlice());
                     temp_hasher.final(&buf);
                     break :hsh buf;
                 };

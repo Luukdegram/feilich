@@ -67,13 +67,10 @@ pub const Server = struct {
         var server_key_share: tls.KeyShare = undefined;
         var signature: tls.SignatureAlgorithm = undefined;
         var server_exchange: tls.KeyExchange = undefined;
-        var cipher: Cipher = undefined;
+        var cipher: tls.Cipher = undefined;
 
         const record = try tls.Record.readFrom(reader);
-        if (record.len > 1 << 14) {
-            try writeAlert(.fatal, .record_overflow, writer);
-            return error.IllegalLength;
-        }
+        try ensureLength(record.len, writer);
         if (record.record_type != .handshake) {
             try writeAlert(.fatal, .unexpected_message, writer);
             return error.UnexpectedRecordType;
@@ -225,39 +222,74 @@ pub const Server = struct {
             temp_hasher.final(&buf);
             break :blk buf;
         };
+
+        // secrets to encrypt our data and decrypt client data.
         const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
         const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
 
         const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", 16);
         const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", 16);
 
+        // nonce for data decryption from client to server
         const client_handshake_iv = blk: {
             var buf: [32]u8 = undefined;
             std.mem.copy(u8, &buf, &client_secret);
             break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
         };
-
+        // nonce for data encryption from server to client
         const server_handshake_iv = blk: {
             var buf: [32]u8 = undefined;
             std.mem.copy(u8, &buf, &server_secret);
             break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
         };
 
-        _ = client_handshake_iv;
-        _ = server_handshake_iv;
         _ = client_handshake_key;
         _ = server_handshake_key;
 
         // -- Write the encrypted message that wraps multiple handshake headers -- //
-        try handshake_writer.handshakeFinish(server_secret, self.public_key, cipher);
+        try handshake_writer.handshakeFinish(server_secret, server_handshake_iv, self.public_key, cipher);
+
+        // -- Expect client response with encrypted data --//
+        const data_record = try tls.Record.readFrom(reader);
+        if (data_record.record_type == .alert) {
+            const alert = try tls.Alert.readFrom(reader);
+            if (alert.severity == .fatal) {
+                return alert.toError();
+            }
+            std.log.warn("Received client warning: {s}", .{@tagName(alert.tag)});
+        }
+        try ensureLength(data_record.len, writer);
+
+        var record_data: [1 << 14]u8 = undefined;
+        try reader.readNoEof(record_data[0..data_record.len]);
+        const auth_tag = record[0 .. data_record.len - 16][0..16];
+
+        var decrypted_data: [1 << 14]u8 = undefined;
+        try cipher.decrypt(
+            record_data[0 .. data_record.len - 16],
+            &decrypted_data,
+            auth_tag,
+            &data_record.toBytes(),
+            client_handshake_iv,
+            client_secret,
+        );
     }
 
     /// Constructs an alert record and writes it to the client's connection.
-    /// When an alert is fatal, it is illegal to write any more data to the `writer`.
-    fn writeAlert(severity: tls.AlertLevel, alert: tls.Alert, writer: anytype) @TypeOf(writer).Error!void {
+    /// When an alert is fatal, it is illegal to write any more data to the `writer`
+    /// as the connection will be closed by both server and client.
+    fn writeAlert(severity: tls.Alert.Severity, tag: tls.Alert.Tag, writer: anytype) @TypeOf(writer).Error!void {
         const record = tls.Record.init(.alert, 2); // 2 bytes for level and description.
         try record.writeTo(writer);
-        try writer.writeAll(&.{ severity.int(), alert.int() });
+        try writer.writeAll(&.{ severity.int(), tag.int() });
+    }
+
+    /// Tests if given `length` surpasses the max record length of 2^14
+    fn ensureLength(length: usize, writer: anytype) @TypeOf(writer).Error!void {
+        if (length > 1 << 14) {
+            try writeAlert(.fatal, .record_overflow, writer);
+            return error.IllegalLength;
+        }
     }
 };
 
