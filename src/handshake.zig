@@ -268,7 +268,13 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
 
         /// Sends the remaining messages required to finish the handshake.
         /// Wraps all messages and encrypts them, using the provided Cipher.
-        pub fn handshakeFinish(self: *Self, server_secret: [32]u8, certificate: []const u8, cipher: *tls.Cipher) !void {
+        pub fn handshakeFinish(
+            self: *Self,
+            server_secret: [32]u8,
+            handshake_iv: [12]u8,
+            certificate: []const u8,
+            cipher: *tls.Cipher,
+        ) !void {
             var builder = RecordBuilder.init();
             const builder_writer = builder.writer();
             // encrypted extensions
@@ -319,7 +325,11 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             builder.endMessage();
 
             // write directly to the writer as we do not need to hash it again.
-            try builder.writeRecord(.application_data, self.writer.context.writer, .{ .cipher = cipher });
+            try builder.writeRecord(.application_data, self.writer.context.writer, .{ .cipher_data = .{
+                .cipher = cipher,
+                .server_iv = handshake_iv,
+                .server_secret = server_secret,
+            } });
         }
     };
 }
@@ -393,20 +403,61 @@ pub const RecordBuilder = struct {
     ///
     /// Will used the provided `tls.Cipher` when the tag of `encryption` is set to `cipher`, to encrypt
     /// the data before writing it.
-    pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype, encryption: union(enum) {
-        none: void,
-        cipher: *tls.Cipher,
-    }) @TypeOf(any_writer).Error!void {
+    pub fn writeRecord(
+        self: RecordBuilder,
+        /// Type of Record to emit
+        tag: tls.Record.RecordType,
+        /// The writer to write to
+        any_writer: anytype,
+        /// Whether the record's contents requires to be encrypted or not,
+        /// and the cipher to user to encrypt the data.
+        encryption: union(enum) {
+            none: void,
+            cipher_data: struct {
+                cipher: *tls.Cipher,
+                server_iv: [12]u8,
+                server_secret: [32]u8,
+            },
+        },
+    ) @TypeOf(any_writer).Error!void {
         std.debug.assert(self.state == .end);
+
+        const data_len = @intCast(u16, self.length());
+        var record = tls.Record.init(tag, data_len);
+
+        // Only used when `encryption` is not `.none`
+        var auth_tag: [16]u8 = undefined;
         const application_data = switch (encryption) {
             .none => self.toSlice(),
-            .cipher => |cipher| try cipher.encrypt(),
+            .cipher_data => |cipher_data| blk: {
+                record.len += 16; // auth_tag len
+
+                const cipher: *tls.Cipher = cipher_data.cipher;
+                var buf: [1 << 14]u8 = undefined;
+                var ad: [5]u8 = undefined;
+                ad[0] = @enumToInt(record.record_type);
+                mem.writeIntBig(u16, ad[1..3], record.protocol_version);
+                mem.writeIntBig(u16, ad[3..5], record.len);
+
+                cipher.encrypt(
+                    &buf,
+                    &auth_tag,
+                    self.toSlice(),
+                    &ad,
+                    cipher_data.server_iv,
+                    cipher_data.server_secret,
+                );
+                break :blk buf[0..data_len];
+            },
         };
 
-        var record = tls.Record.init(tag, application_data.len);
         try record.writeTo(any_writer);
 
         try any_writer.writeAll(application_data);
+
+        if (encryption == .cipher_data) {
+            try any_writer.writeAll(&auth_tag);
+        }
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.
@@ -427,6 +478,11 @@ pub const RecordBuilder = struct {
             .start => |idx| self.buffer[0..idx],
             .end => self.buffer[0..self.index],
         };
+    }
+
+    /// Returns the length of the currently written data
+    pub fn length(self: RecordBuilder) usize {
+        return self.index;
     }
 };
 
@@ -579,10 +635,10 @@ test "RecordBuilder" {
     var stream = std.io.fixedBufferStream(&buf);
     const writer = stream.writer();
     var builder = RecordBuilder.init();
-    builder.startRecord(.finished);
+    builder.startMessage(.finished);
     builder.writer().writeAll(&finished_bytes) catch unreachable;
-    builder.endRecord();
-    try builder.writeRecord(.application_data, writer);
+    builder.endMessage();
+    try builder.writeRecord(.application_data, writer, .none);
 
     // zig fmt: off
     try std.testing.expectEqualSlices(u8, &([_]u8{

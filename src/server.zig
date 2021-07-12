@@ -67,6 +67,7 @@ pub const Server = struct {
         var server_key_share: tls.KeyShare = undefined;
         var signature: tls.SignatureAlgorithm = undefined;
         var server_exchange: tls.KeyExchange = undefined;
+        var cipher: Cipher = undefined;
 
         const record = try tls.Record.readFrom(reader);
         if (record.len > 1 << 14) {
@@ -90,6 +91,7 @@ pub const Server = struct {
                 .client_hello => |client_result| {
                     const suite = for (client_result.cipher_suites) |suite| {
                         if (tls.supported_cipher_suites.isSupported(suite)) {
+                            cipher = suite.cipher();
                             break suite;
                         }
                     } else {
@@ -247,7 +249,7 @@ pub const Server = struct {
         _ = server_handshake_key;
 
         // -- Write the encrypted message that wraps multiple handshake headers -- //
-        try handshake_writer.handshakeFinish();
+        try handshake_writer.handshakeFinish(server_secret, self.public_key, cipher);
     }
 
     /// Constructs an alert record and writes it to the client's connection.
@@ -459,9 +461,10 @@ test "Encrypt initial wrapper" {
         0x3c, 0xdd, 0xbd, 0xe3,
     };
 
-    var auth_tag: [16]u8 = .{
+    const auth_tag_verify: [16]u8 = .{
         0xe0, 0x8b, 0x0e, 0x45, 0x5a, 0x35, 0x0a, 0xe5, 0x4d, 0x76, 0x34, 0x9a, 0xa6, 0x8c, 0x71, 0xae,
     };
+    var auth_tag: [16]u8 = undefined;
 
     const message = encrypted_extensions ++ certificate_bytes ++ server_certificate_verify ++ handshake_finished ++ [_]u8{0x16};
     var buf: [message.len]u8 = undefined;
@@ -543,4 +546,6 @@ test "Encrypt initial wrapper" {
         0xec, 0x9b, 0x22, 0x2f, 0xa0, 0x9f, 0x37, 0x4b, 0xd9, 0x68, 0x81, 0xac, 0x2d, 0xdd, 0x1f, 0x88,
         0x5d, 0x42, 0xea, 0x58, 0x4c,
     }, &buf);
+
+    try std.testing.expectEqualSlices(u8, &auth_tag_verify, &auth_tag);
 }
