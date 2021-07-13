@@ -209,10 +209,10 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             var builder = RecordBuilder.init();
             builder.startMessage(.server_hello);
             const writer = builder.writer();
-            try writer.writeByte(HandshakeType.server_hello.int());
+            writer.writeByte(HandshakeType.server_hello.int()) catch unreachable;
 
             // Means TLS 1.2, this is legacy and actual version is sent through extensions
-            try writer.writeIntBig(u16, 0x303);
+            writer.writeIntBig(u16, 0x303) catch unreachable;
 
             const server_random = switch (kind) {
                 .server_hello => blk: {
@@ -231,21 +231,21 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                     break :blk random;
                 },
             };
-            try writer.writeAll(&server_random);
+            writer.writeAll(&server_random) catch unreachable;
 
             // session_id is legacy and no longer used. In TLS 1.3 we
             // can just 'echo' client's session id.
-            try writer.writeAll(&session_id);
+            writer.writeAll(&session_id) catch unreachable;
 
             // cipher suite
-            try writer.writeIntBig(u16, cipher_suite.int());
+            writer.writeIntBig(u16, cipher_suite.int()) catch unreachable;
 
             // Compression methods, which is no longer allowed for TLS 1.3 so assign "null"
             const compression_methods = &[_]u8{ 0x1, 0x00 };
-            try writer.writeAll(compression_methods);
+            writer.writeAll(compression_methods) catch unreachable;
 
             // write the extension length (46 bytes)
-            try writer.writeIntBig(u16, 0x002E);
+            writer.writeIntBig(u16, 0x002E) catch unreachable;
 
             // Extension -- Key Share
             // TODO: When sending a retry, we should only send the named_group we want.
@@ -260,17 +260,17 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 // actual version (TLS 1.3)
                 0x03, 0x04,
             };
-            try writer.writeAll(supported_versions);
+            writer.writeAll(supported_versions) catch unreachable;
 
             builder.endMessage();
-            try builder.writeRecord(.handshake, self.writer.writer());
+            try builder.writeRecord(.handshake, self.writer.writer(), .none);
         }
 
         /// Sends the remaining messages required to finish the handshake.
         /// Wraps all messages and encrypts them, using the provided Cipher.
         pub fn handshakeFinish(
             self: *Self,
-            server_secret: [32]u8,
+            server_key: [32]u8,
             handshake_iv: [12]u8,
             certificate: []const u8,
             cipher: *tls.Cipher,
@@ -284,20 +284,23 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
 
             // Certificate
             builder.startMessage(.certificate);
-            builder_writer.writeByte(0x00); // request context
+            builder_writer.writeByte(0x00) catch unreachable; // request context
             // Full length of all certificates
             // For now, only support a single one
             // 5 extra bytes as we write the length of the first
             // certificate once more, and the certificate extensions.
-            builder_writer.writeIntBig(u24, @intCast(u24, certificate.len + 5));
-            builder_writer.writeIntBig(u24, @intCast(u23, certificate.len));
-            builder_writer.writeAll(certificate);
-            builder_writer.writeAll(&.{ 0x00, 0x00 }); // no extensions
+            builder_writer.writeIntBig(u24, @intCast(u24, certificate.len + 5)) catch unreachable;
+            builder_writer.writeIntBig(u24, @intCast(u23, certificate.len)) catch unreachable;
+            builder_writer.writeAll(certificate) catch unreachable;
+            builder_writer.writeAll(&.{ 0x00, 0x00 }) catch unreachable; // no extensions
             builder.endMessage();
 
             // Certificate verify
             builder.startMessage(.certificate_verify);
-            builder_writer.writeIntBig(u16, signature.int());
+            // TODO - Now we use cipher's suite.
+            // Ofcourse this must be the signature signer
+            // (ECDSA)
+            builder_writer.writeIntBig(u16, cipher.cipher_suite.int()) catch unreachable;
             // TODO write the actual signature
             // For this we need ECDSA
             builder.endMessage();
@@ -305,11 +308,11 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             // handshake finished type
             builder.startMessage(.finished);
             const verify_data: [32]u8 = blk: {
-                const finished_key = tls.hkdfExpandLabel(server_secret, "finished", "", 32);
+                const finished_key = tls.hkdfExpandLabel(server_key, "finished", "", 32);
                 // copy hasher
                 const finished_hash: [32]u8 = hsh: {
-                    self.writer.context.update(builder.toSlice());
-                    var temp_hasher = self.writer.context.hash;
+                    self.writer.hash.update(builder.toSlice());
+                    var temp_hasher = self.writer.hash;
                     var buf: [32]u8 = undefined;
                     // add the data between server hello and cert verify
                     // Will not include the `finished` message.
@@ -318,17 +321,17 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 };
 
                 var out: [32]u8 = undefined;
-                std.crypto.auth.hmac.sha2.HmacSha256.create(&out, finished_key, finished_hash);
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&out, &finished_key, &finished_hash);
                 break :blk out;
             };
-            builder_writer.writeAll(&verify_data);
+            builder_writer.writeAll(&verify_data) catch unreachable;
             builder.endMessage();
 
             // write directly to the writer as we do not need to hash it again.
-            try builder.writeRecord(.application_data, self.writer.context.writer, .{ .cipher_data = .{
+            try builder.writeRecord(.application_data, self.writer.any_writer, .{ .cipher_data = .{
                 .cipher = cipher,
                 .server_iv = handshake_iv,
-                .server_secret = server_secret,
+                .server_secret = server_key,
             } });
         }
     };
@@ -452,12 +455,11 @@ pub const RecordBuilder = struct {
         };
 
         try record.writeTo(any_writer);
-
         try any_writer.writeAll(application_data);
-
         if (encryption == .cipher_data) {
             try any_writer.writeAll(&auth_tag);
         }
+        try any_writer.writeByte(record.record_type.int());
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.
@@ -653,7 +655,7 @@ test "RecordBuilder" {
         // handshake header length
         0x00, 0x00, 0x20,
         // actual finished bytes
-    } ++ finished_bytes),
+    } ++ finished_bytes ++ [_]u8{0x14}),
     stream.getWritten());
     // zig fmt: on
 }

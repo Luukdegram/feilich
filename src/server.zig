@@ -38,11 +38,12 @@ pub const Server = struct {
         UnsupportedSignatureAlgorithm,
         /// The client has sent a record whose length exceeds 2^14-1 bytes
         IllegalLength,
-        /// Client has sent an unexpected record type
+        /// Client has sent an unexpected record type, or closed it with a
+        /// different record type than it was opened with.
         UnexpectedRecordType,
         /// Host ran out of memory
         OutOfMemory,
-    } || crypto.errors.IdentityElementError;
+    } || crypto.errors.IdentityElementError || tls.Alert.Error || tls.Cipher.Error;
 
     /// Initializes a new `Server` instance for a given public/private key pair.
     pub fn init(gpa: *Allocator, private_key: []const u8, public_key: []const u8) Server {
@@ -67,7 +68,7 @@ pub const Server = struct {
         var server_key_share: tls.KeyShare = undefined;
         var signature: tls.SignatureAlgorithm = undefined;
         var server_exchange: tls.KeyExchange = undefined;
-        var cipher: tls.Cipher = undefined;
+        var cipher: ?*tls.Cipher = null;
 
         const record = try tls.Record.readFrom(reader);
         try ensureLength(record.len, writer);
@@ -223,31 +224,20 @@ pub const Server = struct {
             break :blk buf;
         };
 
-        // secrets to encrypt our data and decrypt client data.
+        // secrets to generate our keys
         const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
         const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
 
-        const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", 16);
-        const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", 16);
+        // keys used to encrypt and decrypt client/server data.
+        const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", 32);
+        const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", 32);
 
-        // nonce for data decryption from client to server
-        const client_handshake_iv = blk: {
-            var buf: [32]u8 = undefined;
-            std.mem.copy(u8, &buf, &client_secret);
-            break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
-        };
-        // nonce for data encryption from server to client
-        const server_handshake_iv = blk: {
-            var buf: [32]u8 = undefined;
-            std.mem.copy(u8, &buf, &server_secret);
-            break :blk tls.hkdfExpandLabel(buf, "iv", "", 12);
-        };
-
-        _ = client_handshake_key;
-        _ = server_handshake_key;
+        // nonces for data decryption/encryption from/to client/server.
+        const client_handshake_iv = tls.hkdfExpandLabel(client_secret, "iv", "", 12);
+        const server_handshake_iv = tls.hkdfExpandLabel(server_secret, "iv", "", 12);
 
         // -- Write the encrypted message that wraps multiple handshake headers -- //
-        try handshake_writer.handshakeFinish(server_secret, server_handshake_iv, self.public_key, cipher);
+        try handshake_writer.handshakeFinish(server_handshake_key, server_handshake_iv, self.public_key, cipher.?);
 
         // -- Expect client response with encrypted data --//
         const data_record = try tls.Record.readFrom(reader);
@@ -256,23 +246,46 @@ pub const Server = struct {
             if (alert.severity == .fatal) {
                 return alert.toError();
             }
-            std.log.warn("Received client warning: {s}", .{@tagName(alert.tag)});
+            std.log.warn("{s}", .{@tagName(alert.tag)});
         }
         try ensureLength(data_record.len, writer);
+        // Ensure the last byte is the handshake record type
+        if (@intToEnum(tls.Record.RecordType, try reader.readByte()) != .handshake) {
+            try writeAlert(.fatal, .decode_error, writer);
+            return error.UnexpectedRecordType;
+        }
 
         var record_data: [1 << 14]u8 = undefined;
         try reader.readNoEof(record_data[0..data_record.len]);
-        const auth_tag = record[0 .. data_record.len - 16][0..16];
+        const auth_tag = record_data[0 .. data_record.len - 16][0..16].*;
 
         var decrypted_data: [1 << 14]u8 = undefined;
-        try cipher.decrypt(
+        try cipher.?.decrypt(
             record_data[0 .. data_record.len - 16],
             &decrypted_data,
             auth_tag,
             &data_record.toBytes(),
             client_handshake_iv,
-            client_secret,
+            client_handshake_key,
         );
+
+        const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..3].*);
+        if (hs_msg.handshake_type != .finished) {
+            try writeAlert(.fatal, .unexpected_message, writer);
+            return error.UnexpectedMessage;
+        }
+        const finished_data = decrypted_data[3..][0..hs_msg.length];
+        const finished_key = tls.hkdfExpandLabel(client_secret, "finished", "", 32);
+        hasher.update(finished_data);
+        const finished_hash = blk: {
+            var tmp_hash = hasher;
+            var buf: [32]u8 = undefined;
+            tmp_hash.final(&buf);
+            break :blk buf;
+        };
+
+        var verify_data: [32]u8 = undefined;
+        crypto.auth.hmac.sha2.HmacSha256.create(&verify_data, &finished_key, &finished_hash);
     }
 
     /// Constructs an alert record and writes it to the client's connection.
@@ -282,10 +295,14 @@ pub const Server = struct {
         const record = tls.Record.init(.alert, 2); // 2 bytes for level and description.
         try record.writeTo(writer);
         try writer.writeAll(&.{ severity.int(), tag.int() });
+        switch (severity) {
+            .warning => std.log.warn("{s}", .{@tagName(tag)}),
+            .fatal => std.log.err("{s}", .{@tagName(tag)}),
+        }
     }
 
     /// Tests if given `length` surpasses the max record length of 2^14
-    fn ensureLength(length: usize, writer: anytype) @TypeOf(writer).Error!void {
+    fn ensureLength(length: usize, writer: anytype) (@TypeOf(writer).Error || error{IllegalLength})!void {
         if (length > 1 << 14) {
             try writeAlert(.fatal, .record_overflow, writer);
             return error.IllegalLength;

@@ -29,6 +29,10 @@ pub const Record = extern struct {
         alert = 21,
         handshake = 22,
         application_data = 23,
+
+        pub fn int(self: RecordType) u8 {
+            return @enumToInt(self);
+        }
     };
 
     /// Initializes a new `Record` that always has its `protocol_version` set to 0x0303.
@@ -74,7 +78,7 @@ pub const Alert = struct {
     }
 
     /// Reads an alert from a given `reader`
-    pub fn readFrom(reader: anytype) @TypeOf(reader).Error!Alert {
+    pub fn readFrom(reader: anytype) (@TypeOf(reader).Error || error{EndOfStream})!Alert {
         return Alert{
             .severity = @intToEnum(Severity, try reader.readByte()),
             .tag = @intToEnum(Tag, try reader.readByte()),
@@ -152,7 +156,7 @@ pub const Alert = struct {
         certificate_required = 116,
         no_application_protocol = 120,
 
-        pub fn int(self: Alert) u8 {
+        pub fn int(self: Tag) u8 {
             return @enumToInt(self);
         }
     };
@@ -164,7 +168,7 @@ pub const Alert = struct {
         warning = 1,
         fatal = 2,
 
-        pub fn int(self: AlertLevel) u8 {
+        pub fn int(self: Severity) u8 {
             return @enumToInt(self);
         }
     };
@@ -303,6 +307,8 @@ pub const CipherSuite = enum(u16) {
     tls_chacha20_poly1305_sha256 = 0x1303,
     tls_aes_128_ccm_sha256 = 0x1304,
     tls_aes_128_ccm_8_sha256 = 0x1305,
+    /// Unsupported, legacy suites
+    _,
 
     pub fn int(self: CipherSuite) u16 {
         return @enumToInt(self);
@@ -310,7 +316,7 @@ pub const CipherSuite = enum(u16) {
 
     /// Returns a `Cipher` from the given `CipherSuite`,
     /// used to encrypt TLS data before sending it to the peer.
-    pub fn cipher(self: CipherSuite) Cipher {
+    pub fn cipher(self: CipherSuite) *Cipher {
         return ciphers.fromSuite(self);
     }
 };
@@ -320,9 +326,9 @@ pub const CipherSuite = enum(u16) {
 /// that are supported by TLS 1.3 itself.
 pub const supported_cipher_suites = struct {
     pub const set: []const CipherSuite = &.{
-        .tls_aes_128_ccm_sha256,
-        .tls_aes_256_gcm_sha384,
-        .tls_chacha20_poly1305_sha256,
+        .tls_aes_128_gcm_sha256,
+        // .tls_aes_256_gcm_sha384,
+        // .tls_chacha20_poly1305_sha256,
     };
 
     /// Returns true when a given `CipherSuite` is supported
@@ -666,7 +672,9 @@ pub const Cipher = struct {
     /// Implementation of the encryption function pointer
     encryptFn: fn (*Cipher, []u8, *[tag_length]u8, []const u8, []const u8, [nonce_length]u8, [key_len]u8) void,
     /// Implementation of the decryption function pointer
-    decryptFn: fn ([]u8, []u8, [tag_length]u8, []const u8, [nonce_length]u8, [key_len]u8) Error!void,
+    decryptFn: fn (*Cipher, []u8, []u8, [tag_length]u8, []const u8, [nonce_length]u8, [key_len]u8) Error!void,
+    /// Cipher suite it implements
+    cipher_suite: CipherSuite,
 
     /// Encrypts a message using a given Cipher implementation
     pub fn encrypt(
@@ -689,15 +697,19 @@ pub const Cipher = struct {
         auth_tag: [tag_length]u8,
         ad: []const u8,
         nonce: [nonce_length]u8,
-        key: [key_length]u8,
-    ) Cipher.Error!void {
+        key: [key_len]u8,
+    ) Error!void {
         return self.decryptFn(self, msg, buf, auth_tag, ad, nonce, key);
     }
 };
 
 pub const ciphers = struct {
     const _aes256 = struct {
-        var state = Cipher{ .encryptFn = encrypt };
+        var state = Cipher{
+            .encryptFn = encrypt,
+            .decryptFn = decrypt,
+            .cipher_suite = .tls_aes_128_gcm_sha256,
+        };
         const Aes256 = crypto.aead.aes_gcm.Aes256Gcm;
 
         fn encrypt(
@@ -731,7 +743,7 @@ pub const ciphers = struct {
     pub const aes256Gcm = &_aes256.state;
 
     /// Returns a `Cipher` from a given `CipherSuite`
-    pub fn fromSuite(suite: CipherSuite) Cipher {
+    pub fn fromSuite(suite: CipherSuite) *Cipher {
         return switch (suite) {
             .tls_aes_128_gcm_sha256 => aes256Gcm,
             else => @panic("TODO: Implement more cipher suites"),
