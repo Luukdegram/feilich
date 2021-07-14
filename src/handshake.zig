@@ -7,7 +7,9 @@
 const std = @import("std");
 const tls = @import("tls.zig");
 const mem = std.mem;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const crypto = std.crypto;
+const Sha256 = crypto.hash.sha2.Sha256;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 
 /// Represents the possible handshake types
 pub const HandshakeType = enum(u8) {
@@ -64,7 +66,7 @@ pub fn ReadWriteError(comptime ReaderType: type, comptime WriterType: type) type
 }
 
 /// Initializes a new reader that decodes and performs a handshake
-pub fn handshakeReader(reader: anytype, hasher: Sha256) HandshakeReader(@TypeOf(reader)) {
+pub fn handshakeReader(reader: anytype, hasher: *Sha256) HandshakeReader(@TypeOf(reader)) {
     return HandshakeReader(@TypeOf(reader)).init(reader, hasher);
 }
 
@@ -95,7 +97,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 
         /// Initializes a new instance of `HandshakeReader` of a given reader that must be of
         /// `ReaderType`.
-        pub fn init(reader: ReaderType, hasher: Sha256) Self {
+        pub fn init(reader: ReaderType, hasher: *Sha256) Self {
             return .{ .reader = HashReader(ReaderType).init(reader, hasher) };
         }
 
@@ -167,7 +169,7 @@ pub fn HandshakeReader(comptime ReaderType: type) type {
 /// Initializes a new `HandshakeWriter`, deducing the type of a given
 /// instance of a `writer`. The handshake writer will construct all
 /// required messages for a succesful handshake.
-pub fn handshakeWriter(writer: anytype, hasher: Sha256) HandshakeWriter(@TypeOf(writer)) {
+pub fn handshakeWriter(writer: anytype, hasher: *Sha256) HandshakeWriter(@TypeOf(writer)) {
     return HandshakeWriter(@TypeOf(writer)).init(writer, hasher);
 }
 
@@ -177,14 +179,15 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
     return struct {
         const Self = @This();
 
-        writer: HashWriter(WriterType),
+        writer: WriterType,
+        hasher: *Sha256,
 
         const Error = WriterType.Error;
 
         /// Initializes a new `HandshakeWriter` by wrapping the given `writer` into
         /// a `HashWriter` and setting up the hasher.
-        pub fn init(writer: WriterType, hasher: Sha256) Self {
-            return .{ .writer = HashWriter(WriterType).init(writer, hasher) };
+        pub fn init(writer: WriterType, hasher: *Sha256) Self {
+            return .{ .writer = writer, .hasher = hasher };
         }
 
         /// Constructs and sends a 'Server Hello' message to the client.
@@ -258,8 +261,8 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             };
             writer.writeAll(supported_versions) catch unreachable;
 
-            builder.endMessage();
-            try builder.writeRecord(.handshake, null, self.writer.any_writer, .none);
+            builder.endMessage(self.hasher);
+            try builder.writeRecord(.handshake, null, self.writer, .none);
         }
 
         /// Sends the remaining messages required to finish the handshake.
@@ -276,7 +279,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             // encrypted extensions
             builder.startMessage(.encrypted_extensions);
             builder_writer.writeAll(&.{ 0x00, 0x00 }) catch unreachable;
-            builder.endMessage();
+            builder.endMessage(self.hasher);
 
             // Certificate
             builder.startMessage(.certificate);
@@ -289,7 +292,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             builder_writer.writeIntBig(u24, @intCast(u23, certificate.len)) catch unreachable;
             builder_writer.writeAll(certificate) catch unreachable;
             builder_writer.writeAll(&.{ 0x00, 0x00 }) catch unreachable; // no extensions
-            builder.endMessage();
+            builder.endMessage(self.hasher);
 
             // Certificate verify
             builder.startMessage(.certificate_verify);
@@ -299,7 +302,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             builder_writer.writeIntBig(u16, cipher.cipher_suite.int()) catch unreachable;
             // TODO write the actual signature
             // For this we need ECDSA
-            builder.endMessage();
+            builder.endMessage(self.hasher);
 
             // handshake finished type
             builder.startMessage(.finished);
@@ -307,8 +310,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 const finished_key = tls.hkdfExpandLabel(server_key, "finished", "", 32);
                 // copy hasher
                 const finished_hash: [32]u8 = hsh: {
-                    self.writer.hash.update(builder.toSlice());
-                    var temp_hasher = self.writer.hash;
+                    var temp_hasher = self.hasher.*;
                     var buf: [32]u8 = undefined;
                     // add the data between server hello and cert verify
                     // Will not include the `finished` message.
@@ -317,11 +319,11 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
                 };
 
                 var out: [32]u8 = undefined;
-                std.crypto.auth.hmac.sha2.HmacSha256.create(&out, &finished_key, &finished_hash);
+                HmacSha256.create(&out, &finished_key, &finished_hash);
                 break :blk out;
             };
             builder_writer.writeAll(&verify_data) catch unreachable;
-            builder.endMessage();
+            builder.endMessage(self.hasher);
 
             const encryption: RecordBuilder.Encryption = .{
                 .cipher_data = .{
@@ -332,7 +334,8 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             };
             _ = encryption;
             // write directly to the writer as we do not need to hash it again.
-            // try builder.writeRecord(.application_data, .handshake, self.writer.any_writer, encryption);
+            // TODO: Enable this when we implemented ECDSA
+            // try builder.writeRecord(.application_data, .handshake, self.writer, encryption);
         }
     };
 }
@@ -382,12 +385,13 @@ const RecordBuilder = struct {
 
     /// Ends the current Handshake message (NOT the total record), updates the state
     /// and writes the written length to the handshake record.
-    pub fn endMessage(self: *RecordBuilder) void {
+    pub fn endMessage(self: *RecordBuilder, hasher: *Sha256) void {
         std.debug.assert(self.state == .start);
         defer self.state = .end;
         const idx = self.state.start;
         const len = self.index - idx - 3; // 3 bytes for writing the index
         std.mem.writeIntBig(u24, self.buffer[idx..][0..3], len);
+        hasher.update(self.buffer[idx - 1 ..][0..len]);
     }
 
     /// Writes to the internal buffer, asserting a handshake record was set.
@@ -501,12 +505,12 @@ const RecordBuilder = struct {
 fn HashReader(comptime ReaderType: type) type {
     return struct {
         const Self = @This();
-        hash: Sha256,
+        hash: *Sha256,
         any_reader: ReaderType,
 
         const Error = ReaderType.Error;
 
-        pub fn init(any_reader: ReaderType, hash: Sha256) Self {
+        pub fn init(any_reader: ReaderType, hash: *Sha256) Self {
             return .{ .any_reader = any_reader, .hash = hash };
         }
 
@@ -519,35 +523,6 @@ fn HashReader(comptime ReaderType: type) type {
         }
 
         pub fn reader(self: *Self) std.io.Reader(*Self, Error, read) {
-            return .{ .context = self };
-        }
-    };
-}
-
-/// Constructs a writer that hashes each write's content
-/// NOTE: It does not write the hashed content.
-fn HashWriter(comptime WriterType: type) type {
-    return struct {
-        const Self = @This();
-
-        hash: Sha256,
-        any_writer: WriterType,
-
-        const Error = WriterType.Error;
-
-        pub fn init(any_writer: WriterType, hash: Sha256) Self {
-            return .{ .any_writer = any_writer, .hash = hash };
-        }
-
-        pub fn write(self: *Self, bytes: []const u8) Error!usize {
-            const len = try self.any_writer.write(bytes);
-            if (len != 0) {
-                self.hash.update(bytes[0..len]);
-            }
-            return len;
-        }
-
-        pub fn writer(self: *Self) std.io.Writer(*Self, Error, write) {
             return .{ .context = self };
         }
     };
@@ -608,7 +583,8 @@ test "Client Hello" {
     // zig fmt: on
 
     var fb_reader = std.io.fixedBufferStream(&data).reader();
-    var hs_reader = handshakeReader(fb_reader, Sha256.init(.{}));
+    var hasher = Sha256.init(.{});
+    var hs_reader = handshakeReader(fb_reader, &hasher);
     const result = try hs_reader.decode();
     const client_hello = result.client_hello;
 
@@ -640,7 +616,8 @@ test "Server Hello" {
     var buf: [2048]u8 = undefined;
     var fb = std.io.fixedBufferStream(&buf);
     const writer = fb.writer();
-    var hs_writer = handshakeWriter(writer, Sha256.init(.{}));
+    var hasher = Sha256.init(.{});
+    var hs_writer = handshakeWriter(writer, &hasher);
     const session_id: [32]u8 = .{
         0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
         0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
@@ -708,9 +685,10 @@ test "RecordBuilder" {
     var stream = std.io.fixedBufferStream(&buf);
     const writer = stream.writer();
     var builder = RecordBuilder.init();
+    var hasher = Sha256.init(.{});
     builder.startMessage(.finished);
     builder.writer().writeAll(&finished_bytes) catch unreachable;
-    builder.endMessage();
+    builder.endMessage(&hasher);
     try builder.writeRecord(.application_data, null, writer, .none);
 
     // zig fmt: off
