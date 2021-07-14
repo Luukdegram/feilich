@@ -15,6 +15,7 @@ pub fn main() !void {
 
         tls_server.connect(stream.reader(), stream.writer()) catch |err| {
             std.log.debug("Error: {s}\n", .{@errorName(err)});
+            return;
         };
     }
 }

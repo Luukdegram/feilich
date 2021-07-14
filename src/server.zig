@@ -43,6 +43,8 @@ pub const Server = struct {
         UnexpectedRecordType,
         /// Host ran out of memory
         OutOfMemory,
+        /// Peer has closed the connection with the host.
+        EndOfStream,
     } || crypto.errors.IdentityElementError || tls.Alert.Error || tls.Cipher.Error;
 
     /// Initializes a new `Server` instance for a given public/private key pair.
@@ -87,10 +89,9 @@ pub const Server = struct {
             const hello_result = try handshake_reader.decode();
             switch (hello_result) {
                 .client_hello => |client_result| {
-                    const suite = for (client_result.cipher_suites) |suite| {
+                    cipher = for (client_result.cipher_suites) |suite| {
                         if (tls.supported_cipher_suites.isSupported(suite)) {
-                            cipher = suite.cipher();
-                            break suite;
+                            break suite.cipher();
                         }
                     } else {
                         try writeAlert(.fatal, .handshake_failure, writer);
@@ -180,17 +181,22 @@ pub const Server = struct {
                         };
                     };
 
-                    // Non-hashed write to send the record header with length
-                    // 122 bytes.
-                    // TODO: Not hardcore the length
-                    try (tls.Record.init(.handshake, 0x007a)).writeTo(writer);
+                    const random_seed = blk: {
+                        // we do not provide TLS downgrading and therefore do not have to set the
+                        // last 8 bytes to specific values as noted in section 4.1.3
+                        // https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
+                        var seed: [32]u8 = undefined;
+                        std.crypto.random.bytes(&seed);
+                        break :blk seed;
+                    };
 
                     // hash and write the server hello
                     try handshake_writer.serverHello(
                         .server_hello,
                         client_result.session_id,
-                        suite,
+                        cipher.?.cipher_suite,
                         server_key_share,
+                        random_seed,
                     );
 
                     // We sent our hello server, meaning we can continue
@@ -241,22 +247,16 @@ pub const Server = struct {
 
         // -- Expect client response with encrypted data --//
         const data_record = try tls.Record.readFrom(reader);
-        if (data_record.record_type == .alert) {
-            const alert = try tls.Alert.readFrom(reader);
-            if (alert.severity == .fatal) {
-                return alert.toError();
-            }
-            std.log.warn("{s}", .{@tagName(alert.tag)});
-        }
+        try ensureNoAlert(data_record, reader);
         try ensureLength(data_record.len, writer);
+
+        var record_data: [1 << 14]u8 = undefined;
+        try reader.readNoEof(record_data[0..data_record.len]);
         // Ensure the last byte is the handshake record type
         if (@intToEnum(tls.Record.RecordType, try reader.readByte()) != .handshake) {
             try writeAlert(.fatal, .decode_error, writer);
             return error.UnexpectedRecordType;
         }
-
-        var record_data: [1 << 14]u8 = undefined;
-        try reader.readNoEof(record_data[0..data_record.len]);
         const auth_tag = record_data[0 .. data_record.len - 16][0..16].*;
 
         var decrypted_data: [1 << 14]u8 = undefined;
@@ -274,9 +274,8 @@ pub const Server = struct {
             try writeAlert(.fatal, .unexpected_message, writer);
             return error.UnexpectedMessage;
         }
-        const finished_data = decrypted_data[3..][0..hs_msg.length];
         const finished_key = tls.hkdfExpandLabel(client_secret, "finished", "", 32);
-        hasher.update(finished_data);
+        hasher.update(decrypted_data[0 .. hs_msg.length + 3]);
         const finished_hash = blk: {
             var tmp_hash = hasher;
             var buf: [32]u8 = undefined;
@@ -286,6 +285,15 @@ pub const Server = struct {
 
         var verify_data: [32]u8 = undefined;
         crypto.auth.hmac.sha2.HmacSha256.create(&verify_data, &finished_key, &finished_hash);
+        std.log.debug("Verify_data: {s}\n", .{&verify_data});
+
+        const ping_record = try tls.Record.readFrom(reader);
+        try ensureNoAlert(ping_record, reader);
+        try ensureLength(ping_record.len, writer);
+        {
+            var encrypted_data: [1 << 14]u8 = undefined;
+            try reader.readNoEof(encrypted_data[0..ping_record.len]);
+        }
     }
 
     /// Constructs an alert record and writes it to the client's connection.
@@ -306,6 +314,16 @@ pub const Server = struct {
         if (length > 1 << 14) {
             try writeAlert(.fatal, .record_overflow, writer);
             return error.IllegalLength;
+        }
+    }
+
+    fn ensureNoAlert(record: tls.Record, reader: anytype) (@TypeOf(reader).Error || Error)!void {
+        if (record.record_type == .alert) {
+            const alert = try tls.Alert.readFrom(reader);
+            if (alert.severity == .fatal) {
+                return alert.toError();
+            }
+            std.log.warn("{s}", .{@tagName(alert.tag)});
         }
     }
 };

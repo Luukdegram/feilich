@@ -386,7 +386,7 @@ pub const KeyShare = struct {
         try writer.writeIntBig(u16, Extension.Tag.key_share.int());
         try writer.writeIntBig(u16, 0x0024); // length (36 bytes)
         try writer.writeIntBig(u16, self.named_group.int());
-        try writer.writeIntBig(u16, 0x0020); // public key length (32 bytes)
+        try writer.writeIntBig(u16, 0x20); // public key length (32 bytes)
         try writer.writeAll(&self.key_exchange);
     }
 };
