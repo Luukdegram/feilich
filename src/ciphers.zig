@@ -62,10 +62,6 @@ pub const Aes128 = struct {
     /// Ensure all data is correct by calling `verify` once all data is received.
     pub fn decryptPartial(self: *Aes128, out: []u8, data: []const u8, idx: *usize) void {
         self.mac.update(data);
-        self.mac.pad();
-
-        // var j: [16]u8 = undefined;
-        // mem.writeIntBig(u128, &j, self.j);
         ctr(@TypeOf(self.ctx), self.ctx, out, data, &self.j, idx, .Big);
     }
 
@@ -74,6 +70,7 @@ pub const Aes128 = struct {
     pub fn verify(self: *Aes128, auth_tag: [tag_length]u8, message_length: usize) !void {
         defer self.deinit();
 
+        self.mac.pad();
         var final_block: [16]u8 = undefined;
         mem.writeIntBig(u64, final_block[0..8], 5 * 8); // RecordHeader is always 5 bytes.
         mem.writeIntBig(u64, final_block[8..16], message_length * 8); // message length we have decrypted til this point.
@@ -222,6 +219,6 @@ test "Aes128 - multiple messages" {
     try std.testing.expectEqual(half_length, idx);
     state.decryptPartial(m2[half_length..], c[half_length..], &idx);
     try std.testing.expectEqual(m.len, idx);
-    // try state.verify(tag, m.len);
+    try state.verify(tag, m.len);
     try std.testing.expectEqualSlices(u8, m[0..], m2[0..]);
 }
