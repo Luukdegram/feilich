@@ -15,6 +15,14 @@ fn ReturnType(comptime T: type) type {
     return @typeInfo(T).Fn.return_type.?;
 }
 
+/// Supported cipher suites
+pub const supported = [_]type{
+    Aes128,
+};
+
+/// Type for our key data
+pub const KeyStorage = KeyData(&supported);
+
 pub const Aes128 = struct {
     ctx: ReturnType(@TypeOf(StdAes128.initEnc)),
     mac: crypto.onetimeauth.Ghash,
@@ -29,17 +37,17 @@ pub const Aes128 = struct {
     pub const nonce_length = Aes128Gcm.nonce_length;
     pub const key_length = Aes128Gcm.key_length;
 
-    pub fn init(key: [key_length]u8, iv: [nonce_length]u8, sequence: u64, ad: []const u8) Aes128 {
-        const ctx = StdAes128.initEnc(key);
+    pub fn init(key_data: *KeyStorage, sequence: u64, ad: []const u8) Aes128 {
+        const ctx = StdAes128.initEnc(key_data.serverKey(Aes128).*);
         var h: [16]u8 = undefined;
         ctx.encrypt(&h, &[_]u8{0} ** 16);
 
-        var iv_copy = iv;
+        var iv_copy = key_data.serverIv(Aes128).*;
         xorIv(&iv_copy, sequence);
 
         var t: [16]u8 = undefined;
         var j: [16]u8 = undefined;
-        mem.copy(u8, j[0..nonce_length], &iv);
+        mem.copy(u8, j[0..nonce_length], &iv_copy);
         mem.writeIntBig(u32, j[nonce_length..][0..4], 1);
         ctx.encrypt(&t, &j);
 
@@ -68,8 +76,6 @@ pub const Aes128 = struct {
     /// Verifies that all decrypted data til this point was valid.
     /// NOTE: Usage of this instance is illegal behavior after calling verify
     pub fn verify(self: *Aes128, auth_tag: [tag_length]u8, message_length: usize) !void {
-        defer self.deinit();
-
         self.mac.pad();
         var final_block: [16]u8 = undefined;
         mem.writeIntBig(u64, final_block[0..8], 5 * 8); // RecordHeader is always 5 bytes.
@@ -185,8 +191,11 @@ pub fn ctr(
 }
 
 test "Aes128 - single message" {
+    var key_data = KeyStorage{};
     const key: [Aes128.key_length]u8 = [_]u8{0x69} ** Aes128.key_length;
+    key_data.setServerKey(Aes128, key);
     const nonce: [Aes128.nonce_length]u8 = [_]u8{0x42} ** Aes128.nonce_length;
+    key_data.setServerIv(Aes128, nonce);
     const m = "Test with message only";
     const record: tls.Record = .{ .record_type = .application_data, .len = m.len };
     var c: [m.len]u8 = undefined;
@@ -194,7 +203,7 @@ test "Aes128 - single message" {
     var tag: [Aes128.tag_length]u8 = undefined;
 
     crypto.aead.aes_gcm.Aes128Gcm.encrypt(&c, &tag, m, &record.toBytes(), nonce, key);
-    var state = Aes128.init(key, nonce, 0, &record.toBytes());
+    var state = Aes128.init(&key_data, 0, &record.toBytes());
     var idx: usize = 0;
     state.decryptPartial(&m2, &c, &idx);
     try state.verify(tag, m.len);
@@ -203,8 +212,11 @@ test "Aes128 - single message" {
 }
 
 test "Aes128 - multiple messages" {
+    var key_data = KeyStorage{};
     const key: [Aes128.key_length]u8 = [_]u8{0x69} ** Aes128.key_length;
+    key_data.setServerKey(Aes128, key);
     const nonce: [Aes128.nonce_length]u8 = [_]u8{0x42} ** Aes128.nonce_length;
+    key_data.setServerIv(Aes128, nonce);
     const m = "Test with message only";
     const half_length = m.len / 2;
     var idx: usize = 0;
@@ -214,11 +226,75 @@ test "Aes128 - multiple messages" {
     var tag: [Aes128.tag_length]u8 = undefined;
 
     crypto.aead.aes_gcm.Aes128Gcm.encrypt(&c, &tag, m, &record.toBytes(), nonce, key);
-    var state = Aes128.init(key, nonce, 0, &record.toBytes());
+    var state = Aes128.init(&key_data, 0, &record.toBytes());
     state.decryptPartial(m2[0..half_length], c[0..half_length], &idx);
     try std.testing.expectEqual(half_length, idx);
     state.decryptPartial(m2[half_length..], c[half_length..], &idx);
     try std.testing.expectEqual(m.len, idx);
     try state.verify(tag, m.len);
     try std.testing.expectEqualSlices(u8, m[0..], m2[0..]);
+}
+
+/// Manages storage of key data, generic over a slice
+/// of cipher types. Allowing us to store and read key data
+/// in correct lengths.
+pub fn KeyData(comptime ciphers: []const type) type {
+    comptime var max_length: usize = 0;
+    inline for (ciphers) |cipher| {
+        var total = cipher.nonce_length + cipher.key_length;
+        total *= 2;
+        if (total > max_length) {
+            max_length = total;
+        }
+    }
+
+    return struct {
+        const Self = @This();
+
+        data: [max_length]u8 = undefined,
+
+        /// Returns the server IV array based on a given cipher type
+        pub fn serverIv(self: *Self, comptime cipher: type) *[cipher.nonce_length]u8 {
+            const start_index = cipher.key_length * 2;
+            return self.data[start_index..][0..cipher.nonce_length];
+        }
+
+        /// Returns the client IV array based on a given cipher type
+        pub fn clientIv(self: *Self, comptime cipher: type) *[cipher.nonce_length]u8 {
+            const start_index = (cipher.key_length * 2) + cipher.nonce_length;
+            return self.data[start_index..][0..cipher.nonce_length];
+        }
+
+        /// Returns the server secret key of a given cipher type
+        pub fn serverKey(self: *Self, comptime cipher: type) *[cipher.key_length]u8 {
+            return self.data[0..cipher.key_length];
+        }
+
+        /// Returns the client secret key of a given cipher type
+        pub fn clientKey(self: *Self, comptime cipher: type) *[cipher.key_length]u8 {
+            return self.data[cipher.key_length..][0..cipher.key_length];
+        }
+
+        /// Sets the server IV
+        pub fn setServerIv(self: *Self, comptime cipher: type, data: [cipher.nonce_length]u8) void {
+            const start_index = cipher.key_length * 2;
+            self.data[start_index..][0..cipher.nonce_length].* = data;
+        }
+
+        /// Sets the client IV
+        pub fn setClientIv(self: *Self, comptime cipher: type, data: [cipher.nonce_length]u8) void {
+            const start_index = (cipher.key_length * 2) + cipher.nonce_length;
+            self.data[start_index..][0..cipher.nonce_length].* = data;
+        }
+
+        /// Sets the client IV
+        pub fn setServerKey(self: *Self, comptime cipher: type, data: [cipher.key_length]u8) void {
+            self.data[0..cipher.key_length].* = data;
+        }
+
+        /// Sets the client IV
+        pub fn setClientKey(self: *Self, comptime cipher: type, data: [cipher.key_length]u8) void {
+            self.data[cipher.key_length..][0..cipher.key_length].* = data;
+        }
+    };
 }
