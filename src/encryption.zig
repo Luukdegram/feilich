@@ -41,6 +41,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
             reading: struct {
                 length: u16,
                 index: usize,
+                context: Context(ciphers.supported),
             },
         };
 
@@ -73,6 +74,33 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
             return .{ .context = self };
         }
 
+        /// Returns a pointer to the context of the currently used cipher.
+        ///
+        /// User must ensure `reader_state` is `reading`.
+        /// User must ensure given `suite` is a supported cipher suite as found
+        /// in `tls.supported`.
+        fn context(self: *Self, comptime suite: tls.CipherSuite) *ciphers.TypeFromSuite(cipher) {
+            return for (supported) |cipher| {
+                if (cipher.suite == suite) {
+                    break &@field(self.reader_state.reading.context, @tagName(suite));
+                }
+            } else unreachable; // User must provide supported cipher suite
+        }
+
+        /// Returns the index of the current context as a mutable pointer.
+        ///
+        /// NOTE: User must ensure current state is `reader_state`
+        inline fn index(self: *Self) *usize {
+            return &self.reader_state.reading.index;
+        }
+
+        /// Returns the length of the current record.
+        ///
+        /// NOTE: User must ensure current state is `reader_state`
+        inline fn recordLength(self: Self) u16 {
+            return self.reader_state.reading.length;
+        }
+
         /// performs a single read, attempts to decrypt the data if required
         /// and returns the length that was read from the connection.
         pub fn read(self: *Self, buf: []u8) ReadError!usize {
@@ -82,17 +110,22 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                 if (record_header.record_type != .application_data and
                     record_header.record_type != .alert)
                 {
-                    return error.TODOWriteAlert;
+                    const alert = tls.Alert.init(.unexpected_message, .fatal);
+                    try alert.writeTo(self.writer());
+                    return error.UnexpectedMessage;
                 }
 
                 inline for (ciphers.supported) |cipher| {
                     if (cipher.suite == self.cipher) {
                         self.reader_state = .{
-                            .length = record_header.len,
+                            .length = record_header.len - 16, // minus auth tag
                             .index = 0,
+                            .context = cipher.init(
+                                self.key_storage,
+                                self.client_seq,
+                                &record_header.toBytes(),
+                            ),
                         };
-                        const blub = cipher.init(self.key_storage, self.server_seq, &record_header.toBytes());
-                        _ = blub;
                     }
                 }
 
@@ -106,22 +139,22 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     inline for (tls.ciphers) |cipher| {
                         if (cipher.suite == self.cipher) {
                             cipher.decryptPartial(
-                                &@field(self.reader_state.reading.context, @tagName(cipher.suite)),
+                                self.context(cipher.suite),
                                 &alert_buf,
                                 &encrypted,
-                                &self.reader_state.reading.index,
+                                self.index(),
                             );
 
-                            assert(self.reader_state.reading.index == record_header.len);
+                            assert(self.index().* == self.recordLength());
                             try cipher.verify(
-                                &@field(self.reader_state.reading.context, @tagName(cipher.suite)),
+                                self.context(cipher.suite),
                                 auth_tag,
-                                record_header.len,
+                                self.recordLength(),
                             );
                         }
                     }
                     self.reader_state = .start;
-                    self.server_seq += 1;
+                    self.client_seq += 1;
 
                     const alert = tls.Alert.fromBytes(encrypted);
                     if (alert.tag == .close_notify) {
@@ -130,8 +163,100 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     return alert.toError();
                 }
 
-                const min_length = math.min(record_header.len, buf.len);
+                // decrypt in max sizes of 1024 bytes
+                // TODO: Check if we increase this.
+                // The reason we do this is because we need double buffers,
+                // one to store encrypted data, and the user provided buffer
+                // to write the decrypted data to.
+                // This will never read more than record length.
+                const max_length = math.min(math.min(self.recordLength(), 1024), buf.len);
+                var encrypted: [1024]u8 = undefined;
+
+                const read_len = try self.inner_reader.read(encrypted[0..max_length]);
+                inline for (ciphers.supported) |cipher| {
+                    if (cipher.suite == self.cipher) {
+                        cipher.decryptPartial(
+                            self.context(cipher.suite),
+                            buffer[0..read_len],
+                            encrypted[0..read_len],
+                            self.index(),
+                        );
+
+                        // If we read all data, verify its authentication
+                        if (self.index().* == self.recordLength()) {
+                            const auth_tag = try self.readAuthTag();
+                            try cipher.verify(
+                                self.context(cipher.suite),
+                                auth_tag,
+                                self.recordLength(),
+                            );
+
+                            self.client_seq += 1;
+                            self.reader_state = .start;
+                        }
+                    }
+                }
+                return read_len;
+            }
+            // state is `reading`
+            const state = &self.reader_state.reading;
+            const max_len = math.min(math.min(buf.len, 1024), state.length - state.index);
+
+            var encrypted: [1024]u8 = undefined;
+            const read_len = try self.inner_reader.read(encrypted[0..max_len]);
+
+            inline for (ciphers.supported) |cipher| {
+                if (cipher.suite == self.suite) {
+                    cipher.decryptPartial(
+                        &state.context,
+                        buffer[0..read_len],
+                        encrypted[0..read_len],
+                        &state.index,
+                    );
+
+                    if (state.index == state.length) {
+                        const auth_tag = try self.readAuthTag();
+                        try cipher.verify(
+                            &state.context,
+                            auth_tag,
+                            state.length,
+                        );
+
+                        self.client_seq += 1;
+                        self.reader_state = .start;
+                    }
+                }
             }
         }
+
+        /// Reads an authentication tag from the inner reader.
+        /// Returns `EndOfStream` if stream is not long enough.
+        fn readAuthTag(self: *Self) ReadError![16]u8 {
+            var buf: [16]u8 = undefined;
+            try self.inner_reader.readNoEof(&buf);
+            return buf;
+        }
     };
+}
+
+/// Creates a union where each tag is a type corresponding
+/// to a given list of ciphers.
+fn Context(comptime cipher_suites: []const type) type {
+    var fields: [cipher_suites.len]std.builtin.TypeInfo.UnionField = undefined;
+    for (cipher_suites) |cipher, index| {
+        fields[index] = .{
+            .name = @tagName(cipher.suite),
+            .field_type = cipher.Context,
+            .alignment = @alignOf(cipher.Context),
+        };
+    }
+
+    return @Type(.{
+        .Union = .{
+            .layout = .Extern,
+            .tag_type = null,
+            .fields = &fields,
+            .decls = &.{},
+        },
+    });
 }
