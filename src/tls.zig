@@ -85,10 +85,18 @@ pub const Alert = struct {
         };
     }
 
+    /// Initializes a new `Alert` from a given byte array.
+    pub fn fromBytes(bytes: [2]u8) Alert {
+        return Alert{
+            .severity = @intToEnum(Severity, bytes[0]),
+            .tag = @intToEnum(Tag, bytes[1]),
+        };
+    }
+
     /// Writes the Alert to a given `writer` stream.
-    pub fn writeTo(self: Alert, writer: anytype) @TypeOf(writer)!void {
-        try writer.write(self.severity.int());
-        try writer.write(self.tag.int());
+    pub fn writeTo(self: Alert, writer: anytype) @TypeOf(writer).Error!void {
+        try writer.writeByte(self.severity.int());
+        try writer.writeByte(self.tag.int());
     }
 
     /// Returns the `Tag` of an `Alert` as an `Error`. Can be used
@@ -312,31 +320,6 @@ pub const CipherSuite = enum(u16) {
 
     pub fn int(self: CipherSuite) u16 {
         return @enumToInt(self);
-    }
-
-    /// Returns a `Cipher` from the given `CipherSuite`,
-    /// used to encrypt TLS data before sending it to the peer.
-    pub fn cipher(self: CipherSuite) *Cipher {
-        return ciphers.fromSuite(self);
-    }
-};
-
-/// Table of supported `CipherSuite` of this library.
-/// This may contain only a subset of the all suites
-/// that are supported by TLS 1.3 itself.
-pub const supported_cipher_suites = struct {
-    pub const set: []const CipherSuite = &.{
-        .tls_aes_128_gcm_sha256,
-        // .tls_aes_256_gcm_sha384,
-        // .tls_chacha20_poly1305_sha256,
-    };
-
-    /// Returns true when a given `CipherSuite` is supported
-    /// by this library.
-    pub fn isSupported(suite: CipherSuite) bool {
-        return for (set) |item| {
-            if (item == suite) break true;
-        } else false;
     }
 };
 
@@ -659,98 +642,6 @@ pub const curves = struct {
     }
 };
 
-/// Ciphers are used to encrypt data during
-/// the TLS handshake process.
-pub const Cipher = struct {
-    // TODO: Support different sizes?
-    const tag_length = 16;
-    const nonce_length = 12;
-    const key_len = 32;
-
-    pub const Error = error{AuthenticationFailed};
-
-    /// Implementation of the encryption function pointer
-    encryptFn: fn (*Cipher, []u8, *[tag_length]u8, []const u8, []const u8, [nonce_length]u8, [key_len]u8) void,
-    /// Implementation of the decryption function pointer
-    decryptFn: fn (*Cipher, []u8, []u8, [tag_length]u8, []const u8, [nonce_length]u8, [key_len]u8) Error!void,
-    /// Cipher suite it implements
-    cipher_suite: CipherSuite,
-
-    /// Encrypts a message using a given Cipher implementation
-    pub fn encrypt(
-        self: *Cipher,
-        buf: []u8,
-        auth_tag: *[tag_length]u8,
-        msg: []const u8,
-        ad: []const u8,
-        nonce: [nonce_length]u8,
-        key: [key_len]u8,
-    ) void {
-        self.encryptFn(self, buf, auth_tag, msg, ad, nonce, key);
-    }
-
-    /// Decrypts a message using a given Cipher implementation
-    pub fn decrypt(
-        self: *Cipher,
-        msg: []u8,
-        buf: []u8,
-        auth_tag: [tag_length]u8,
-        ad: []const u8,
-        nonce: [nonce_length]u8,
-        key: [key_len]u8,
-    ) Error!void {
-        return self.decryptFn(self, msg, buf, auth_tag, ad, nonce, key);
-    }
-};
-
-pub const ciphers = struct {
-    const _aes256 = struct {
-        var state = Cipher{
-            .encryptFn = encrypt,
-            .decryptFn = decrypt,
-            .cipher_suite = .tls_aes_128_gcm_sha256,
-        };
-        const Aes256 = crypto.aead.aes_gcm.Aes256Gcm;
-
-        fn encrypt(
-            cipher: *Cipher,
-            /// A buffer which size is big enough to contain `msg`
-            buf: []u8,
-            auth_tag: *[Aes256.tag_length]u8,
-            /// The actual message to encrypt
-            msg: []const u8,
-            ad: []const u8,
-            nonce: [Aes256.nonce_length]u8,
-            key: [Aes256.key_length]u8,
-        ) void {
-            _ = cipher;
-            Aes256.encrypt(buf, auth_tag, msg, ad, nonce, key);
-        }
-
-        fn decrypt(
-            cipher: *Cipher,
-            msg: []u8,
-            buf: []u8,
-            auth_tag: [Aes256.tag_length]u8,
-            ad: []const u8,
-            nonce: [Aes256.nonce_length]u8,
-            key: [Aes256.key_length]u8,
-        ) Cipher.Error!void {
-            _ = cipher;
-            try Aes256.decrypt(msg, buf, auth_tag, ad, nonce, key);
-        }
-    };
-    pub const aes256Gcm = &_aes256.state;
-
-    /// Returns a `Cipher` from a given `CipherSuite`
-    pub fn fromSuite(suite: CipherSuite) *Cipher {
-        return switch (suite) {
-            .tls_aes_128_gcm_sha256 => aes256Gcm,
-            else => @panic("TODO: Implement more cipher suites"),
-        };
-    }
-};
-
 test "x25519 curve" {
     const x_curve = curves.x25519;
     const private_key = [_]u8{
@@ -818,4 +709,16 @@ test "hkdfExpandLabel" {
         0x48, 0x25, 0x0c, 0xeb, 0xea, 0xc3, 0x57,
         0x6c, 0x36, 0x11, 0xba,
     }, &derived_secret);
+}
+
+test "runtime cipher suite" {
+    // var suite_we_want: CipherSuite = .tls_aes_128_gcm_sha256;
+    // inline for (supported_cipher_suites.set) |supported| {
+    //     if (supported == suite_we_want) {
+    //         const CipherType = ciphers.TypeFromSuite(supported);
+    //         var selected_cipher = CipherType.default;
+    //         const cipher: *Cipher = selected_cipher.cipher();
+    //         try std.testing.expectEqual(CipherSuite.tls_aes_128_gcm_sha256, cipher.cipher_suite);
+    //     }
+    // }
 }

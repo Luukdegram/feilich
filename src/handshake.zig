@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const tls = @import("tls.zig");
+const ciphers = @import("ciphers.zig");
 const mem = std.mem;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
@@ -33,10 +34,10 @@ pub const HandshakeType = enum(u8) {
 /// Handshake-specific header record type
 pub const HandshakeHeader = struct {
     handshake_type: HandshakeType,
-    length: u16,
+    length: u24,
 
     /// Converts the header into bytes
-    pub fn toBytes(self: HandshakeHeader) [3]u8 {
+    pub fn toBytes(self: HandshakeHeader) [4]u8 {
         var buf: [3]u8 = undefined;
         buf[0] = self.handshake_type.int();
         mem.writeIntBig(16, buf[1..3], self.length);
@@ -47,7 +48,7 @@ pub const HandshakeHeader = struct {
     pub fn fromBytes(bytes: [3]u8) HandshakeHeader {
         return .{
             .handshake_type = @intToEnum(HandshakeType, bytes[0]),
-            .length = mem.readIntBig(u16, bytes[1..3]),
+            .length = mem.readIntBig(u24, bytes[1..4]),
         };
     }
 };
@@ -262,17 +263,17 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             writer.writeAll(supported_versions) catch unreachable;
 
             builder.endMessage(self.hasher);
-            try builder.writeRecord(.handshake, null, self.writer, .none);
+            try builder.writeRecord(.handshake, self.writer);
         }
 
         /// Sends the remaining messages required to finish the handshake.
         /// Wraps all messages and encrypts them, using the provided Cipher.
         pub fn handshakeFinish(
             self: *Self,
-            server_key: [32]u8,
-            handshake_iv: [12]u8,
+            comptime Cipher: type,
+            key_storage: *ciphers.KeyStorage,
             certificate: []const u8,
-            cipher: *tls.Cipher,
+            sequence: u64,
         ) !void {
             var builder = RecordBuilder.init();
             const builder_writer = builder.writer();
@@ -299,7 +300,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             // TODO - Now we use cipher's suite.
             // Ofcourse this must be the signature signer
             // (ECDSA)
-            builder_writer.writeIntBig(u16, cipher.cipher_suite.int()) catch unreachable;
+            builder_writer.writeIntBig(u16, Cipher.suite.int()) catch unreachable;
             // TODO write the actual signature
             // For this we need ECDSA
             builder.endMessage(self.hasher);
@@ -307,7 +308,9 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             // handshake finished type
             builder.startMessage(.finished);
             const verify_data: [32]u8 = blk: {
-                const finished_key = tls.hkdfExpandLabel(server_key, "finished", "", 32);
+                var server_buf: [32]u8 = undefined;
+                server_buf[0..Cipher.key_length].* = key_storage.serverKey(Cipher).*;
+                const finished_key = tls.hkdfExpandLabel(server_buf, "finished", "", 32);
                 // copy hasher
                 const finished_hash: [32]u8 = hsh: {
                     var temp_hasher = self.hasher.*;
@@ -325,17 +328,13 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             builder_writer.writeAll(&verify_data) catch unreachable;
             builder.endMessage(self.hasher);
 
-            const encryption: RecordBuilder.Encryption = .{
-                .cipher_data = .{
-                    .cipher = cipher,
-                    .server_iv = handshake_iv,
-                    .server_secret = server_key,
-                },
-            };
-            _ = encryption;
-            // write directly to the writer as we do not need to hash it again.
-            // TODO: Enable this when we implemented ECDSA
-            // try builder.writeRecord(.application_data, .handshake, self.writer, encryption);
+            try builder.writeRecordEncrypted(
+                .handshake,
+                self.writer,
+                Cipher,
+                key_storage,
+                sequence,
+            );
         }
     };
 }
@@ -359,14 +358,9 @@ const RecordBuilder = struct {
     const Error = error{};
 
     const CipherData = struct {
-        cipher: *tls.Cipher,
-        server_iv: [12]u8,
-        server_secret: [32]u8,
-    };
-
-    const Encryption = union(enum) {
-        none: void,
-        cipher_data: CipherData,
+        cipher: type,
+        key_storage: *ciphers.KeyStorage,
+        sequence: u64,
     };
 
     pub fn init() RecordBuilder {
@@ -418,60 +412,49 @@ const RecordBuilder = struct {
     /// Asserts a started handshake record was ended before calling this.
     ///
     /// This does not reset the internal buffer. For that, use `reset()`.
-    ///
-    /// Will used the provided `tls.Cipher` when the tag of `encryption` is set to `cipher`, to encrypt
-    /// the data before writing it.
-    pub fn writeRecord(
-        self: RecordBuilder,
-        /// Type of Record to emit, can be used to send a different type
-        /// of record as "application data"
-        tag: tls.Record.RecordType,
-        /// Type of Record that is truly used when `tag` is application_data.
-        actual_tag: ?tls.Record.RecordType,
-        /// The writer to write to
-        any_writer: anytype,
-        /// Whether the record's contents requires to be encrypted or not,
-        /// and the cipher to user to encrypt the data.
-        encryption: Encryption,
-    ) @TypeOf(any_writer).Error!void {
+    pub fn writeRecord(self: RecordBuilder, tag: tls.Record.RecordType, any_writer: anytype) @TypeOf(any_writer).Error!void {
         std.debug.assert(self.state == .end);
 
         const data_len = @intCast(u16, self.length());
         var record = tls.Record.init(tag, data_len);
+        try record.writeTo(any_writer);
+        try any_writer.writeAll(self.toSlice());
+    }
 
-        // Only used when `encryption` is not `.none`
+    /// Writes a new Record to a given writer using a given `tag` of `tls.Record.RecordType`.
+    /// Writes the total length written to this buffer as part of the Record.
+    ///
+    /// Asserts a started handshake record was ended before calling this.
+    ///
+    /// This does not reset the internal buffer. For that, use `reset()`.
+    pub fn writeRecordEncrypted(
+        self: RecordBuilder,
+        tag: tls.Record.RecordType,
+        any_writer: anytype,
+        comptime Cipher: type,
+        key_storage: *ciphers.KeyStorage,
+        sequence: u64,
+    ) @TypeOf(any_writer).Error!void {
+        std.debug.assert(self.state == .end);
+
+        const data_len = @intCast(u16, self.length());
+        var record = tls.Record.init(.application_data, data_len + 16); // include auth tag
+
         var auth_tag: [16]u8 = undefined;
-        const application_data = switch (encryption) {
-            .none => self.toSlice(),
-            .cipher_data => |cipher_data| blk: {
-                record.len += 16; // auth_tag len
-
-                var buf: [1 << 14]u8 = undefined;
-                var ad: [5]u8 = undefined;
-                ad[0] = @enumToInt(record.record_type);
-                mem.writeIntBig(u16, ad[1..3], record.protocol_version);
-                mem.writeIntBig(u16, ad[3..5], record.len);
-
-                cipher_data.cipher.encrypt(
-                    buf[0..self.length()],
-                    &auth_tag,
-                    self.toSlice(),
-                    &ad,
-                    cipher_data.server_iv,
-                    cipher_data.server_secret,
-                );
-                break :blk buf[0..data_len];
-            },
-        };
+        var buf: [1 << 14]u8 = undefined;
+        Cipher.encrypt(
+            key_storage,
+            buf[0..data_len],
+            self.toSlice(),
+            &record.toBytes(),
+            sequence,
+            &auth_tag,
+        );
 
         try record.writeTo(any_writer);
-        try any_writer.writeAll(application_data);
-        if (encryption == .cipher_data) {
-            try any_writer.writeAll(&auth_tag);
-        }
-        if (tag == .application_data) if (actual_tag) |actual| {
-            try any_writer.writeByte(actual.int());
-        };
+        try any_writer.writeAll(buf[0..data_len]);
+        try any_writer.writeAll(&auth_tag);
+        try any_writer.writeByte(tag.int());
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.
@@ -608,8 +591,8 @@ test "Client Hello" {
     }, &client_hello.session_id);
 
     var cipher_bytes = [_]u8{ 0x13, 0x01, 0x13, 0x02, 0x13, 0x03 };
-    const ciphers = tls.bytesToTypedSlice(tls.CipherSuite, &cipher_bytes);
-    try std.testing.expectEqualSlices(tls.CipherSuite, ciphers, client_hello.cipher_suites);
+    const ciphers_slice = tls.bytesToTypedSlice(tls.CipherSuite, &cipher_bytes);
+    try std.testing.expectEqualSlices(tls.CipherSuite, ciphers_slice, client_hello.cipher_suites);
 }
 
 test "Server Hello" {
@@ -689,7 +672,7 @@ test "RecordBuilder" {
     builder.startMessage(.finished);
     builder.writer().writeAll(&finished_bytes) catch unreachable;
     builder.endMessage(&hasher);
-    try builder.writeRecord(.application_data, null, writer, .none);
+    try builder.writeRecord(.application_data, writer);
 
     // zig fmt: off
     try std.testing.expectEqualSlices(u8, &([_]u8{

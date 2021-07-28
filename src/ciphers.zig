@@ -30,9 +30,16 @@ pub const KeyStorage = KeyData(&supported);
 pub fn TypeFromSuite(comptime suite: tls.CipherSuite) type {
     return for (supported) |cipher| {
         if (cipher.suite == suite) {
-            break cipher;
+            break cipher.Context;
         }
-    } else unreachable;
+    } else unreachable; // given `suite` is not supported.
+}
+
+/// Checks if a given `tls.CipherSuite` is supported and implemented.
+pub fn isSupported(suite: tls.CipherSuite) bool {
+    return inline for (supported) |cipher| {
+        if (cipher.suite == suite) break true;
+    } else false;
 }
 
 pub const Aes128 = struct {
@@ -90,7 +97,6 @@ pub const Aes128 = struct {
     }
 
     /// Verifies that all decrypted data til this point was valid.
-    /// NOTE: Usage of this instance is illegal behavior after calling verify
     pub fn verify(self: *Context, auth_tag: [tag_length]u8, message_length: usize) !void {
         self.mac.pad();
         var final_block: [16]u8 = undefined;

@@ -3,7 +3,9 @@
 //! which if succesful will send all data encrypted to the client.
 const std = @import("std");
 const tls = @import("tls.zig");
+const ciphers = @import("ciphers.zig");
 const handshake = @import("handshake.zig");
+const encryption = @import("encryption.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const crypto = std.crypto;
@@ -45,7 +47,7 @@ pub const Server = struct {
         OutOfMemory,
         /// Peer has closed the connection with the host.
         EndOfStream,
-    } || crypto.errors.IdentityElementError || tls.Alert.Error || tls.Cipher.Error;
+    } || crypto.errors.IdentityElementError || tls.Alert.Error;
 
     /// Initializes a new `Server` instance for a given public/private key pair.
     pub fn init(gpa: *Allocator, private_key: []const u8, public_key: []const u8) Server {
@@ -61,16 +63,16 @@ pub const Server = struct {
         reader: anytype,
         /// Writer 'interface' to the client's connection
         writer: anytype,
-    ) (handshake.ReadWriteError(@TypeOf(reader), (@TypeOf(writer))) || Error)!void {
+    ) ConnectError(@TypeOf(reader), @TypeOf(writer))!void {
         var hasher = Sha256.init(.{});
-        var handshake_reader = handshake.handshakeReader(reader, hasher);
-        var handshake_writer = handshake.handshakeWriter(writer, hasher);
+        var handshake_reader = handshake.handshakeReader(reader, &hasher);
+        var handshake_writer = handshake.handshakeWriter(writer, &hasher);
 
         var client_key_share: tls.KeyShare = undefined;
         var server_key_share: tls.KeyShare = undefined;
         var signature: tls.SignatureAlgorithm = undefined;
         var server_exchange: tls.KeyExchange = undefined;
-        var cipher: ?*tls.Cipher = null;
+        var cipher_suite: tls.CipherSuite = undefined;
 
         const record = try tls.Record.readFrom(reader);
         try ensureLength(record.len, writer);
@@ -89,10 +91,8 @@ pub const Server = struct {
             const hello_result = try handshake_reader.decode();
             switch (hello_result) {
                 .client_hello => |client_result| {
-                    cipher = for (client_result.cipher_suites) |suite| {
-                        if (tls.supported_cipher_suites.isSupported(suite)) {
-                            break suite.cipher();
-                        }
+                    cipher_suite = for (client_result.cipher_suites) |suite| {
+                        if (ciphers.isSupported(suite)) break suite;
                     } else {
                         try writeAlert(.fatal, .handshake_failure, writer);
                         return error.UnsupportedCipherSuite;
@@ -194,7 +194,7 @@ pub const Server = struct {
                     try handshake_writer.serverHello(
                         .server_hello,
                         client_result.session_id,
-                        cipher.?.cipher_suite,
+                        cipher_suite,
                         server_key_share,
                         random_seed,
                     );
@@ -234,48 +234,52 @@ pub const Server = struct {
         const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
         const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
 
-        // keys used to encrypt and decrypt client/server data.
-        const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", 32);
-        const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", 32);
+        var key_storage: ciphers.KeyStorage = .{};
+        inline for (ciphers.supported) |cipher| {
+            if (cipher.suite == cipher_suite) {
+                // keys used to encrypt and decrypt client/server data.
+                const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", cipher.key_length);
+                const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", cipher.key_length);
 
-        // nonces for data decryption/encryption from/to client/server.
-        const client_handshake_iv = tls.hkdfExpandLabel(client_secret, "iv", "", 12);
-        const server_handshake_iv = tls.hkdfExpandLabel(server_secret, "iv", "", 12);
+                // nonces for data decryption/encryption from/to client/server.
+                const client_handshake_iv = tls.hkdfExpandLabel(client_secret, "iv", "", cipher.nonce_length);
+                const server_handshake_iv = tls.hkdfExpandLabel(server_secret, "iv", "", cipher.nonce_length);
 
-        // -- Write the encrypted message that wraps multiple handshake headers -- //
-        try handshake_writer.handshakeFinish(server_handshake_key, server_handshake_iv, self.public_key, cipher.?);
+                key_storage.setServerKey(cipher, server_handshake_key);
+                key_storage.setClientKey(cipher, client_handshake_key);
+                key_storage.setServerIv(cipher, server_handshake_iv);
+                key_storage.setClientIv(cipher, client_handshake_iv);
+
+                // -- Write the encrypted message that wraps multiple handshake headers -- //
+                try handshake_writer.handshakeFinish(cipher, &key_storage, self.public_key, 0);
+            }
+        }
+
+        // The encryption read -and writer that we will return back to
+        // the user at the end of the handshake.
+        var encryption_readwriter = encryption.encryptedReadWriter(
+            reader,
+            writer,
+            cipher_suite,
+            key_storage,
+        );
+        const decryption_reader = encryption_readwriter.reader();
+        const encryption_writer = encryption_readwriter.writer();
 
         // -- Expect client response with encrypted data --//
-        const data_record = try tls.Record.readFrom(reader);
-        try ensureNoAlert(data_record, reader);
-        try ensureLength(data_record.len, writer);
-
-        var record_data: [1 << 14]u8 = undefined;
-        try reader.readNoEof(record_data[0..data_record.len]);
-        // Ensure the last byte is the handshake record type
-        if (@intToEnum(tls.Record.RecordType, try reader.readByte()) != .handshake) {
-            try writeAlert(.fatal, .decode_error, writer);
-            return error.UnexpectedRecordType;
-        }
-        const auth_tag = record_data[0 .. data_record.len - 16][0..16].*;
-
         var decrypted_data: [1 << 14]u8 = undefined;
-        try cipher.?.decrypt(
-            record_data[0 .. data_record.len - 16],
-            &decrypted_data,
-            auth_tag,
-            &data_record.toBytes(),
-            client_handshake_iv,
-            client_handshake_key,
-        );
+        var read_len = try decryption_reader.read(&decrypted_data);
+        while (encryption_readwriter.reader_state == .reading) {
+            read_len += try decryption_reader.read(decrypted_data[read_len..]);
+        } else if (read_len == 0) return error.EndOfStream;
 
         const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..3].*);
         if (hs_msg.handshake_type != .finished) {
-            try writeAlert(.fatal, .unexpected_message, writer);
+            const alert = tls.Alert.init(.unexpected_message, .fatal);
+            try alert.writeTo(encryption_writer);
             return error.UnexpectedMessage;
         }
         const finished_key = tls.hkdfExpandLabel(client_secret, "finished", "", 32);
-        hasher.update(decrypted_data[0 .. hs_msg.length + 3]);
         const finished_hash = blk: {
             var tmp_hash = hasher;
             var buf: [32]u8 = undefined;
@@ -285,14 +289,19 @@ pub const Server = struct {
 
         var verify_data: [32]u8 = undefined;
         crypto.auth.hmac.sha2.HmacSha256.create(&verify_data, &finished_key, &finished_hash);
-        std.log.debug("Verify_data: {s}\n", .{&verify_data});
+        if (!std.mem.eql(u8, &verify_data, decrypted_data[4..][0..32])) {
+            const alert = tls.Alert.init(.decrypt_error, .fatal);
+            try alert.writeTo(encryption_writer);
+            return error.UnexpectedMessage;
+        }
 
-        const ping_record = try tls.Record.readFrom(reader);
-        try ensureNoAlert(ping_record, reader);
-        try ensureLength(ping_record.len, writer);
-        {
-            var encrypted_data: [1 << 14]u8 = undefined;
-            try reader.readNoEof(encrypted_data[0..ping_record.len]);
+        var ping: [4]u8 = undefined;
+        try decryption_reader.readNoEof(&ping);
+        std.debug.print("Ping: {s}\n", .{&ping});
+        if (!std.mem.eql(u8, &ping, "ping")) {
+            const alert = tls.Alert.init(.decrypt_error, .fatal);
+            try alert.writeTo(encryption_writer);
+            return error.UnexpectedMessage;
         }
     }
 
@@ -328,6 +337,8 @@ pub const Server = struct {
     }
 };
 
+// --- logical tests --- //
+
 test "Shared key generation" {
     const client_public_key: [32]u8 = .{
         0x35, 0x80, 0x72, 0xd6, 0x36, 0x58, 0x80, 0xd1,
@@ -351,6 +362,13 @@ test "Shared key generation" {
         0x92, 0x0d, 0xcc, 0x77, 0xc8, 0xa0, 0xa0,
         0x88, 0x44, 0x76, 0x24,
     }, &shared.toBytes());
+}
+
+/// Returns the error set calling `connect`
+pub fn ConnectError(comptime ReaderType: type, comptime WriterType: type) type {
+    return handshake.ReadWriteError(ReaderType, WriterType) ||
+        encryption.EncryptedReadWriter(ReaderType, WriterType).Error ||
+        Server.Error;
 }
 
 // Uses example data from https://tls13.ulfheim.net/ to verify

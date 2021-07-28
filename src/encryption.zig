@@ -11,6 +11,30 @@ const io = std.io;
 const math = std.math;
 const assert = std.debug.assert;
 
+/// Initializes a new gneric `EncryptedReadWriter` using a given reader and writer and
+/// the key storage data that belongs to the given cipher suite.
+pub fn encryptedReadWriter(
+    /// Internal reader that is preferably directly from the source.
+    reader: anytype,
+    /// Internal writer that is preferably directly from the source.
+    writer: anytype,
+    /// The cipher suite for which we want to use to encrypt and decrypt the data with.
+    cipher_suite: tls.CipherSuite,
+    /// The storage of all key data that will be used by the cipher suite to encrypt
+    /// and decrypt the data.
+    key_storage: ciphers.KeyStorage,
+) EncryptedReadWriter(@TypeOf(reader), @TypeOf(writer)) {
+    return EncryptedReadWriter(@TypeOf(reader), @TypeOf(writer)).init(
+        reader,
+        writer,
+        key_storage,
+        cipher_suite,
+    );
+}
+
+/// A generic wrapper over a given `ReaderType` and `WriterType`.
+/// This will decrypt any data is receives before providing to the caller,
+/// as well as encrypt data before writing it to the internal writer of `WriterType`.
 pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
         const Self = @This();
@@ -41,7 +65,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
             reading: struct {
                 length: u16,
                 index: usize,
-                context: Context(ciphers.supported),
+                context: Context(&ciphers.supported),
             },
         };
 
@@ -51,17 +75,26 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
         pub const Writer = io.Writer(*Self, WriteError, write);
 
         /// Error set containing the possible errors when performing reads.
-        pub const ReadError = ReaderType.Error || tls.Alert.Error || error{ AuthenticationFailed, EndOfStream };
+        pub const ReadError = ReaderType.Error ||
+            WriterType.Error || tls.Alert.Error ||
+            error{ AuthenticationFailed, EndOfStream };
         /// Error set containing the possible errors when performing writes.
         pub const WriteError = WriterType.Error;
+        /// Merged error set of both `ReadError` and `WriteError`
+        pub const Error = ReadError || WriteError;
 
         /// Initializes a new `EncryptedReadWriter` generic, from a given
         /// `ReaderType` and `WriterType`. This construct allows a user to read decrypted
         /// data and send encrypted data.
         /// The `KeyStorage` must be filled with all key data to ensure the keys can be accessed
         /// when data is being decrypted or encrypted.
-        pub fn init(reader: ReaderType, writer: WriterType, key_storage: ciphers.KeyStorage) Self {
-            return .{ .inner_writer = writer, .inner_reader = reader, .key_storage = key_storage };
+        pub fn init(parent_reader: ReaderType, parent_writer: WriterType, key_storage: ciphers.KeyStorage, cipher: tls.CipherSuite) Self {
+            return .{
+                .inner_writer = parent_writer,
+                .inner_reader = parent_reader,
+                .key_storage = key_storage,
+                .cipher = cipher,
+            };
         }
 
         /// Returns a generic `Reader`
@@ -79,8 +112,8 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
         /// User must ensure `reader_state` is `reading`.
         /// User must ensure given `suite` is a supported cipher suite as found
         /// in `tls.supported`.
-        fn context(self: *Self, comptime suite: tls.CipherSuite) *ciphers.TypeFromSuite(cipher) {
-            return for (supported) |cipher| {
+        inline fn context(self: *Self, comptime suite: tls.CipherSuite) *ciphers.TypeFromSuite(suite) {
+            return inline for (ciphers.supported) |cipher| {
                 if (cipher.suite == suite) {
                     break &@field(self.reader_state.reading.context, @tagName(suite));
                 }
@@ -118,13 +151,19 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                 inline for (ciphers.supported) |cipher| {
                     if (cipher.suite == self.cipher) {
                         self.reader_state = .{
-                            .length = record_header.len - 16, // minus auth tag
-                            .index = 0,
-                            .context = cipher.init(
-                                self.key_storage,
-                                self.client_seq,
-                                &record_header.toBytes(),
-                            ),
+                            .reading = .{
+                                .length = record_header.len - 16, // minus auth tag
+                                .index = 0,
+                                .context = @unionInit(
+                                    Context(&ciphers.supported),
+                                    @tagName(cipher.suite),
+                                    cipher.init(
+                                        &self.key_storage,
+                                        self.client_seq,
+                                        &record_header.toBytes(),
+                                    ),
+                                ),
+                            },
                         };
                     }
                 }
@@ -136,7 +175,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     try self.inner_reader.readNoEof(&auth_tag);
 
                     var alert_buf: [2]u8 = undefined;
-                    inline for (tls.ciphers) |cipher| {
+                    inline for (ciphers.supported) |cipher| {
                         if (cipher.suite == self.cipher) {
                             cipher.decryptPartial(
                                 self.context(cipher.suite),
@@ -177,7 +216,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     if (cipher.suite == self.cipher) {
                         cipher.decryptPartial(
                             self.context(cipher.suite),
-                            buffer[0..read_len],
+                            buf[0..read_len],
                             encrypted[0..read_len],
                             self.index(),
                         );
@@ -206,10 +245,10 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
             const read_len = try self.inner_reader.read(encrypted[0..max_len]);
 
             inline for (ciphers.supported) |cipher| {
-                if (cipher.suite == self.suite) {
+                if (cipher.suite == self.cipher) {
                     cipher.decryptPartial(
-                        &state.context,
-                        buffer[0..read_len],
+                        self.context(cipher.suite),
+                        buf[0..read_len],
                         encrypted[0..read_len],
                         &state.index,
                     );
@@ -217,7 +256,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     if (state.index == state.length) {
                         const auth_tag = try self.readAuthTag();
                         try cipher.verify(
-                            &state.context,
+                            self.context(cipher.suite),
                             auth_tag,
                             state.length,
                         );
@@ -227,6 +266,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                     }
                 }
             }
+            return read_len;
         }
 
         /// Writes encrypted data to the underlying writer.
@@ -241,16 +281,17 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
         /// This will save us many writes.
         pub fn write(self: *Self, data: []const u8) WriteError!usize {
             if (data.len == 0) return 0;
+            std.debug.assert(data.len < 1 << 14); // max record size is 2^14-1
 
             var buf: [4096]u8 = undefined;
             var tag: [16]u8 = undefined;
             const max_len = math.min(4096, data.len);
 
-            const record = tls.Record.init(.application_data, max_len + 16); // tag must be counted as well
+            const record = tls.Record.init(.application_data, @intCast(u16, max_len + 16)); // tag must be counted as well
             inline for (ciphers.supported) |cipher| {
                 if (cipher.suite == self.cipher) {
-                    try cipher.encrypt(
-                        self.key_storage,
+                    cipher.encrypt(
+                        &self.key_storage,
                         buf[0..max_len],
                         data[0..max_len],
                         &record.toBytes(),
