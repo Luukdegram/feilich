@@ -229,6 +229,44 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
             }
         }
 
+        /// Writes encrypted data to the underlying writer.
+        ///
+        /// NOTE: For each write, it will create a new application data record
+        /// with its content encrypted using the current cipher.
+        /// Currently, it's limited to writing 4096 bytes at a time.
+        /// To save writes, it's recommended to wrap the writer into a BufferedWriter
+        ///
+        /// TODO: In the future, perhaps we can keep writing data until all
+        /// contents of `data` has been encrypted.
+        /// This will save us many writes.
+        pub fn write(self: *Self, data: []const u8) WriteError!usize {
+            if (data.len == 0) return 0;
+
+            var buf: [4096]u8 = undefined;
+            var tag: [16]u8 = undefined;
+            const max_len = math.min(4096, data.len);
+
+            const record = tls.Record.init(.application_data, max_len + 16); // tag must be counted as well
+            inline for (ciphers.supported) |cipher| {
+                if (cipher.suite == self.cipher) {
+                    try cipher.encrypt(
+                        self.key_storage,
+                        buf[0..max_len],
+                        data[0..max_len],
+                        &record.toBytes(),
+                        self.server_seq,
+                        &tag,
+                    );
+                }
+            }
+            self.server_seq += 1;
+
+            try record.writeTo(self.inner_writer);
+            try self.inner_writer.writeAll(buf[0..max_len]);
+            try self.inner_writer.writeAll(&tag);
+            return max_len;
+        }
+
         /// Reads an authentication tag from the inner reader.
         /// Returns `EndOfStream` if stream is not long enough.
         fn readAuthTag(self: *Self) ReadError![16]u8 {

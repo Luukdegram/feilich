@@ -23,12 +23,19 @@ pub const supported = [_]type{
 /// Type for our key data
 pub const KeyStorage = KeyData(&supported);
 
-pub const Aes128 = struct {
-    ctx: ReturnType(@TypeOf(StdAes128.initEnc)),
-    mac: crypto.onetimeauth.Ghash,
-    t: u128,
-    j: u128,
+/// Returns the type of a cipher based on a given `tls.CipherSuite`.
+///
+/// It is illegal to provide a suite that is not part of the supported
+/// cipher suites found in `supported`.
+pub fn TypeFromSuite(comptime suite: tls.CipherSuite) type {
+    return for (supported) |cipher| {
+        if (cipher.suite == suite) {
+            break cipher;
+        }
+    } else unreachable;
+}
 
+pub const Aes128 = struct {
     const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
     const StdAes128 = crypto.core.aes.Aes128;
 
@@ -37,7 +44,16 @@ pub const Aes128 = struct {
     pub const nonce_length = Aes128Gcm.nonce_length;
     pub const key_length = Aes128Gcm.key_length;
 
-    pub fn init(key_data: *KeyStorage, sequence: u64, ad: []const u8) Aes128 {
+    pub const Context = struct {
+        ctx: ReturnType(@TypeOf(StdAes128.initEnc)),
+        mac: crypto.onetimeauth.Ghash,
+        t: u128,
+        j: u128,
+    };
+
+    /// Creates a new `Context` for the Aes128Gcm cipher, setting the initiual values
+    /// using the keys provided and the current `sequence.
+    pub fn init(key_data: *KeyStorage, sequence: u64, ad: []const u8) Context {
         const ctx = StdAes128.initEnc(key_data.serverKey(Aes128).*);
         var h: [16]u8 = undefined;
         ctx.encrypt(&h, &[_]u8{0} ** 16);
@@ -68,14 +84,14 @@ pub const Aes128 = struct {
     /// Also writes the read length to `idx`.
     /// NOTE: This does not validate the data.
     /// Ensure all data is correct by calling `verify` once all data is received.
-    pub fn decryptPartial(self: *Aes128, out: []u8, data: []const u8, idx: *usize) void {
-        self.mac.update(data);
-        ctr(@TypeOf(self.ctx), self.ctx, out, data, &self.j, idx, .Big);
+    pub fn decryptPartial(context: *Context, out: []u8, data: []const u8, idx: *usize) void {
+        context.mac.update(data);
+        ctr(@TypeOf(context.ctx), context.ctx, out, data, &context.j, idx, .Big);
     }
 
     /// Verifies that all decrypted data til this point was valid.
     /// NOTE: Usage of this instance is illegal behavior after calling verify
-    pub fn verify(self: *Aes128, auth_tag: [tag_length]u8, message_length: usize) !void {
+    pub fn verify(self: *Context, auth_tag: [tag_length]u8, message_length: usize) !void {
         self.mac.pad();
         var final_block: [16]u8 = undefined;
         mem.writeIntBig(u64, final_block[0..8], 5 * 8); // RecordHeader is always 5 bytes.
@@ -98,9 +114,29 @@ pub const Aes128 = struct {
         }
     }
 
-    /// Sets the instance of `Aes128` to undefined, to prevent usage after finishing.
-    pub fn deinit(self: *Aes128) void {
-        self.* = undefined;
+    /// Encrypts the given `data` and writes it to `out`. Asserts `out` has the same length as `data`.
+    /// An authentication tag is written to `tag`, allowing a peer to verify the data.
+    /// The given `sequence` will be xor'd with the server IV, stored in given `KeyStorage`.
+    pub fn encrypt(
+        /// Contains all keys of the client and server, to encrypt/decrypt the data
+        key_storage: *KeyStorage,
+        /// The buffer that will have the encrypted data written to
+        out: []u8,
+        /// The message to be encrypted
+        data: []const u8,
+        /// Additional data to encrypt with the message, in TLS this is the record header
+        ad: []const u8,
+        /// The sequence of the total amount of encrypted data we've transmitted.
+        /// This will be xor'd with the server nonce.
+        sequence: u64,
+        /// The authentication tag created during the encryption of the data.
+        /// Can be used by the peer to verify the data.
+        tag: *[tag_length]u8,
+    ) void {
+        var iv = key_storage.serverIv(Aes128).*;
+        xorIv(&iv, sequence);
+
+        Aes128Gcm.encrypt(out, tag, data, ad, iv, key_storage.serverKey(Aes128).*);
     }
 
     /// xor's the sequence with a key_iv.
@@ -205,8 +241,8 @@ test "Aes128 - single message" {
     crypto.aead.aes_gcm.Aes128Gcm.encrypt(&c, &tag, m, &record.toBytes(), nonce, key);
     var state = Aes128.init(&key_data, 0, &record.toBytes());
     var idx: usize = 0;
-    state.decryptPartial(&m2, &c, &idx);
-    try state.verify(tag, m.len);
+    Aes128.decryptPartial(&state, &m2, &c, &idx);
+    try Aes128.verify(&state, tag, m.len);
     try std.testing.expectEqualSlices(u8, m[0..], m2[0..]);
     try std.testing.expectEqual(m.len, idx);
 }
@@ -227,11 +263,11 @@ test "Aes128 - multiple messages" {
 
     crypto.aead.aes_gcm.Aes128Gcm.encrypt(&c, &tag, m, &record.toBytes(), nonce, key);
     var state = Aes128.init(&key_data, 0, &record.toBytes());
-    state.decryptPartial(m2[0..half_length], c[0..half_length], &idx);
+    Aes128.decryptPartial(&state, m2[0..half_length], c[0..half_length], &idx);
     try std.testing.expectEqual(half_length, idx);
-    state.decryptPartial(m2[half_length..], c[half_length..], &idx);
+    Aes128.decryptPartial(&state, m2[half_length..], c[half_length..], &idx);
     try std.testing.expectEqual(m.len, idx);
-    try state.verify(tag, m.len);
+    try Aes128.verify(&state, tag, m.len);
     try std.testing.expectEqualSlices(u8, m[0..], m2[0..]);
 }
 
