@@ -38,14 +38,14 @@ pub const HandshakeHeader = struct {
 
     /// Converts the header into bytes
     pub fn toBytes(self: HandshakeHeader) [4]u8 {
-        var buf: [3]u8 = undefined;
+        var buf: [4]u8 = undefined;
         buf[0] = self.handshake_type.int();
-        mem.writeIntBig(16, buf[1..3], self.length);
+        mem.writeIntBig(16, buf[1..4], self.length);
         return buf;
     }
 
     /// Constructs a HandshakeHeader from an array of bytes
-    pub fn fromBytes(bytes: [3]u8) HandshakeHeader {
+    pub fn fromBytes(bytes: [4]u8) HandshakeHeader {
         return .{
             .handshake_type = @intToEnum(HandshakeType, bytes[0]),
             .length = mem.readIntBig(u24, bytes[1..4]),

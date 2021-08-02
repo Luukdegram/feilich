@@ -273,7 +273,7 @@ pub const Server = struct {
             read_len += try decryption_reader.read(decrypted_data[read_len..]);
         } else if (read_len == 0) return error.EndOfStream;
 
-        const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..3].*);
+        const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..4].*);
         if (hs_msg.handshake_type != .finished) {
             const alert = tls.Alert.init(.unexpected_message, .fatal);
             try alert.writeTo(encryption_writer);
@@ -323,16 +323,6 @@ pub const Server = struct {
         if (length > 1 << 14) {
             try writeAlert(.fatal, .record_overflow, writer);
             return error.IllegalLength;
-        }
-    }
-
-    fn ensureNoAlert(record: tls.Record, reader: anytype) (@TypeOf(reader).Error || Error)!void {
-        if (record.record_type == .alert) {
-            const alert = try tls.Alert.readFrom(reader);
-            if (alert.severity == .fatal) {
-                return alert.toError();
-            }
-            std.log.warn("{s}", .{@tagName(alert.tag)});
         }
     }
 };

@@ -51,7 +51,7 @@ pub const KeyPair = struct {
         const affine = q.affineCoordinates();
 
         return KeyPair{
-            .d = try Scalar.fromBytes(seed, .Big),
+            .d = try Scalar.fromBytes(seed, .Little),
             .public_key = .{
                 .x = affine.x.toBytes(.Big),
                 .y = affine.y.toBytes(.Big),
@@ -61,7 +61,7 @@ pub const KeyPair = struct {
 
     /// Verifies the given keypairs are equal
     pub fn eql(self: KeyPair, other: KeyPair) bool {
-        return self.public_key.eql(other) and self.d.equivalent(other.d);
+        return self.d.equivalent(other.d) and self.public_key.eql(other);
     }
 };
 

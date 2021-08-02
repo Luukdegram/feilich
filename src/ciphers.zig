@@ -61,11 +61,11 @@ pub const Aes128 = struct {
     /// Creates a new `Context` for the Aes128Gcm cipher, setting the initiual values
     /// using the keys provided and the current `sequence.
     pub fn init(key_data: *KeyStorage, sequence: u64, ad: []const u8) Context {
-        const ctx = StdAes128.initEnc(key_data.serverKey(Aes128).*);
+        const ctx = StdAes128.initEnc(key_data.clientKey(Aes128).*);
         var h: [16]u8 = undefined;
         ctx.encrypt(&h, &[_]u8{0} ** 16);
 
-        var iv_copy = key_data.serverIv(Aes128).*;
+        var iv_copy = key_data.clientIv(Aes128).*;
         xorIv(&iv_copy, sequence);
 
         var t: [16]u8 = undefined;
@@ -97,16 +97,16 @@ pub const Aes128 = struct {
     }
 
     /// Verifies that all decrypted data til this point was valid.
-    pub fn verify(self: *Context, auth_tag: [tag_length]u8, message_length: usize) !void {
-        self.mac.pad();
+    pub fn verify(context: *Context, auth_tag: [tag_length]u8, message_length: usize) !void {
+        context.mac.pad();
         var final_block: [16]u8 = undefined;
         mem.writeIntBig(u64, final_block[0..8], 5 * 8); // RecordHeader is always 5 bytes.
         mem.writeIntBig(u64, final_block[8..16], message_length * 8); // message length we have decrypted til this point.
-        self.mac.update(&final_block);
+        context.mac.update(&final_block);
         var computed_tag: [Ghash.mac_length]u8 = undefined;
-        self.mac.final(&computed_tag);
+        context.mac.final(&computed_tag);
         var t: [16]u8 = undefined;
-        mem.writeIntBig(u128, &t, self.t);
+        mem.writeIntBig(u128, &t, context.t);
         for (t) |x, i| {
             computed_tag[i] ^= x;
         }
@@ -161,7 +161,7 @@ pub const Aes128 = struct {
 /// Important: the counter mode doesn't provide authenticated encryption: the ciphertext can be trivially modified without this being detected.
 /// As a result, applications should generally never use it directly, but only in a construction that includes a MAC.
 ///
-/// NOTE: Original at: https://github.com/alexnask/iguanaTLS/blob/master/src/crypto.zig#L159
+/// Original from: https://github.com/alexnask/iguanaTLS/blob/master/src/crypto.zig#L159
 pub fn ctr(
     comptime BlockCipher: anytype,
     block_cipher: BlockCipher,
@@ -235,9 +235,9 @@ pub fn ctr(
 test "Aes128 - single message" {
     var key_data = KeyStorage{};
     const key: [Aes128.key_length]u8 = [_]u8{0x69} ** Aes128.key_length;
-    key_data.setServerKey(Aes128, key);
+    key_data.setClientKey(Aes128, key);
     const nonce: [Aes128.nonce_length]u8 = [_]u8{0x42} ** Aes128.nonce_length;
-    key_data.setServerIv(Aes128, nonce);
+    key_data.setClientIv(Aes128, nonce);
     const m = "Test with message only";
     const record: tls.Record = .{ .record_type = .application_data, .len = m.len };
     var c: [m.len]u8 = undefined;
@@ -256,9 +256,9 @@ test "Aes128 - single message" {
 test "Aes128 - multiple messages" {
     var key_data = KeyStorage{};
     const key: [Aes128.key_length]u8 = [_]u8{0x69} ** Aes128.key_length;
-    key_data.setServerKey(Aes128, key);
+    key_data.setClientKey(Aes128, key);
     const nonce: [Aes128.nonce_length]u8 = [_]u8{0x42} ** Aes128.nonce_length;
-    key_data.setServerIv(Aes128, nonce);
+    key_data.setClientIv(Aes128, nonce);
     const m = "Test with message only";
     const half_length = m.len / 2;
     var idx: usize = 0;

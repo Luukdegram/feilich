@@ -11,7 +11,7 @@ const io = std.io;
 const math = std.math;
 const assert = std.debug.assert;
 
-/// Initializes a new gneric `EncryptedReadWriter` using a given reader and writer and
+/// Initializes a new generic `EncryptedReadWriter` using a given reader and writer and
 /// the key storage data that belongs to the given cipher suite.
 pub fn encryptedReadWriter(
     /// Internal reader that is preferably directly from the source.
@@ -55,7 +55,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
         key_storage: ciphers.KeyStorage,
         /// Sequences of encrypted data we have received from the client. This will be xor'd
         /// with the client nonce when decrypting the data.
-        client_seq: u64 = 1,
+        client_seq: u64 = 0,
         /// Sequences of data we have encrypted and set to the client. This will be xor'd
         /// with the server nonce when encrypting the data.
         server_seq: u64 = 1,
@@ -139,10 +139,16 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
         pub fn read(self: *Self, buf: []u8) ReadError!usize {
             if (self.reader_state == .start) {
                 const record_header = try tls.Record.readFrom(self.inner_reader);
+                std.debug.print("Record: {}\n", .{record_header});
 
                 if (record_header.record_type != .application_data and
                     record_header.record_type != .alert)
                 {
+                    if (record_header.record_type == .change_cipher_spec) {
+                        const b = try self.inner_reader.readByte();
+                        assert(b == 0x01);
+                        return self.read(buf);
+                    }
                     const alert = tls.Alert.init(.unexpected_message, .fatal);
                     try alert.writeTo(self.writer());
                     return error.UnexpectedMessage;
@@ -237,6 +243,7 @@ pub fn EncryptedReadWriter(comptime ReaderType: type, comptime WriterType: type)
                 }
                 return read_len;
             }
+
             // state is `reading`
             const state = &self.reader_state.reading;
             const max_len = math.min(math.min(buf.len, 1024), state.length - state.index);
