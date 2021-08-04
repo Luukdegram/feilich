@@ -11,6 +11,7 @@ const mem = std.mem;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const ecdsa = @import("crypto/ecdsa.zig");
 
 /// Represents the possible handshake types
 pub const HandshakeType = enum(u8) {
@@ -273,6 +274,7 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             comptime Cipher: type,
             key_storage: *ciphers.KeyStorage,
             certificate: []const u8,
+            secret: [32]u8,
             sequence: u64,
         ) !void {
             var builder = RecordBuilder.init();
@@ -290,27 +292,35 @@ pub fn HandshakeWriter(comptime WriterType: type) type {
             // 5 extra bytes as we write the length of the first
             // certificate once more, and the certificate extensions.
             builder_writer.writeIntBig(u24, @intCast(u24, certificate.len + 5)) catch unreachable;
-            builder_writer.writeIntBig(u24, @intCast(u23, certificate.len)) catch unreachable;
+            builder_writer.writeIntBig(u24, @intCast(u24, certificate.len)) catch unreachable;
             builder_writer.writeAll(certificate) catch unreachable;
             builder_writer.writeAll(&.{ 0x00, 0x00 }) catch unreachable; // no extensions
             builder.endMessage(self.hasher);
 
             // Certificate verify
             builder.startMessage(.certificate_verify);
-            // TODO - Now we use cipher's suite.
-            // Ofcourse this must be the signature signer
-            // (ECDSA)
             builder_writer.writeIntBig(u16, Cipher.suite.int()) catch unreachable;
-            // TODO write the actual signature
-            // For this we need ECDSA
+            builder_writer.writeIntBig(u16, 64) catch unreachable; // signature length
+
+            // the message we will sign, containing
+            // 0x20 (x64), 34 bytes for "TLS 1.3, server CertificateVerify",
+            // and 32 bytes for the hash of the handshake
+            var sig_msg = [_]u8{0} ** (64 + 34 + 32);
+            sig_msg[0..64].* = [_]u8{0x20} ** 64;
+            std.mem.copy(u8, sig_msg[64..], "TLS 1.3, server CertificateVerify");
+            {
+                var hash_copy = self.hasher;
+                hash_copy.final(sig_msg[64 + 34 ..][0..32]);
+            }
+            // TODO: Get public key from certificate so we can
+            // sign our message and input the bytes
+
             builder.endMessage(self.hasher);
 
             // handshake finished type
             builder.startMessage(.finished);
             const verify_data: [32]u8 = blk: {
-                var server_buf: [32]u8 = undefined;
-                server_buf[0..Cipher.key_length].* = key_storage.serverKey(Cipher).*;
-                const finished_key = tls.hkdfExpandLabel(server_buf, "finished", "", 32);
+                const finished_key = tls.hkdfExpandLabel(secret, "finished", "", 32);
                 // copy hasher
                 const finished_hash: [32]u8 = hsh: {
                     var temp_hasher = self.hasher.*;
@@ -392,6 +402,7 @@ const RecordBuilder = struct {
     /// Updates the internal index on each write and returns the length that
     /// was written to the internal buffer.
     fn write(self: *RecordBuilder, bytes: []const u8) Error!usize {
+        std.debug.assert(bytes.len != 0); // empty slice given.
         std.debug.assert(self.state == .start); // it's illegal to write random data without creating a message type first.
         mem.copy(u8, self.buffer[self.index..], bytes);
         self.index += @intCast(u14, bytes.len);
@@ -428,7 +439,7 @@ const RecordBuilder = struct {
     ///
     /// This does not reset the internal buffer. For that, use `reset()`.
     pub fn writeRecordEncrypted(
-        self: RecordBuilder,
+        self: *RecordBuilder,
         tag: tls.Record.RecordType,
         any_writer: anytype,
         comptime Cipher: type,
@@ -436,6 +447,10 @@ const RecordBuilder = struct {
         sequence: u64,
     ) @TypeOf(any_writer).Error!void {
         std.debug.assert(self.state == .end);
+
+        // Write the actual tag
+        self.buffer[self.index] = tag.int();
+        self.index += 1;
 
         const data_len = @intCast(u16, self.length());
         var record = tls.Record.init(.application_data, data_len + 16); // include auth tag
@@ -454,7 +469,6 @@ const RecordBuilder = struct {
         try record.writeTo(any_writer);
         try any_writer.writeAll(buf[0..data_len]);
         try any_writer.writeAll(&auth_tag);
-        try any_writer.writeByte(tag.int());
     }
 
     /// Resets the internal buffer's index to 0 so we can build a new record.

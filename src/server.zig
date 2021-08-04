@@ -251,7 +251,7 @@ pub const Server = struct {
                 key_storage.setClientIv(cipher, client_handshake_iv);
 
                 // -- Write the encrypted message that wraps multiple handshake headers -- //
-                try handshake_writer.handshakeFinish(cipher, &key_storage, self.public_key, 0);
+                try handshake_writer.handshakeFinish(cipher, &key_storage, self.public_key, server_secret, 0);
             }
         }
 
