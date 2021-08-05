@@ -70,7 +70,7 @@ pub const DecodeError = error{
 /// Decodes given bytes into a `Pem` instance.
 /// Memory is owned by caller and can be freed upon calling `deinit` on
 /// the returned instance.
-pub fn decode(gpa: *Allocator, data: []const u8) !Pem {
+pub fn decode(gpa: *Allocator, data: []const u8) (DecodeError || std.base64.Error)!Pem {
     var maybe_asn_type: ?AsnType = null;
     const begin_offset = if (mem.indexOf(u8, data, "-----BEGIN ")) |offset| blk: {
         const end_offset = mem.indexOfPos(u8, data, offset + 11, "-----") orelse return error.InvalidBegin;
@@ -93,7 +93,7 @@ pub fn decode(gpa: *Allocator, data: []const u8) !Pem {
     end_offset -= @boolToInt(data[end_offset - 1] == '\n');
     end_offset -= @boolToInt(data[end_offset - 1] == '\r');
     const content_to_decode = data[begin_offset..end_offset];
-    const len = std.base64.standard.Decoder.calcSizeForSlice(content_to_decode);
+    const len = try std.base64.standard.Decoder.calcSizeForSlice(content_to_decode);
     const decoded_data = try gpa.alloc(u8, len);
     errdefer gpa.free(decoded_data);
     try std.base64.standard.Decoder.decode(decoded_data, content_to_decode);
@@ -105,7 +105,7 @@ pub fn decode(gpa: *Allocator, data: []const u8) !Pem {
 
 /// Given a file path, will attempt to decode its content into a `Pem` instance.
 /// Memory is owned by the caller.
-pub fn fromFile(gpa: *Allocator, file_path: []const u8) !Pem {
+pub fn fromFile(gpa: *Allocator, file_path: []const u8) (DecodeError || std.base64.Error)!Pem {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
@@ -118,18 +118,17 @@ pub fn fromFile(gpa: *Allocator, file_path: []const u8) !Pem {
 
 test "ASN.1 type CERTIFICATE" {
     const bytes =
-        \\-----BEGIN CERTIFICATE-----
-        \\MIIBmTCCAUegAwIBAgIBKjAJBgUrDgMCHQUAMBMxETAPBgNVBAMTCEF0bGFudGlz
-        \\MB4XDTEyMDcwOTAzMTAzOFoXDTEzMDcwOTAzMTAzN1owEzERMA8GA1UEAxMIQXRs
-        \\YW50aXMwXDANBgkqhkiG9w0BAQEFAANLADBIAkEAu+BXo+miabDIHHx+yquqzqNh
-        \\Ryn/XtkJIIHVcYtHvIX+S1x5ErgMoHehycpoxbErZmVR4GCq1S2diNmRFZCRtQID
-        \\AQABo4GJMIGGMAwGA1UdEwEB/wQCMAAwIAYDVR0EAQH/BBYwFDAOMAwGCisGAQQB
-        \\gjcCARUDAgeAMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDAzA1BgNVHQEE
-        \\LjAsgBA0jOnSSuIHYmnVryHAdywMoRUwEzERMA8GA1UEAxMIQXRsYW50aXOCASow
-        \\CQYFKw4DAh0FAANBAKi6HRBaNEL5R0n56nvfclQNaXiDT174uf+lojzA4lhVInc0
-        \\ILwpnZ1izL4MlI9eCSHhVQBHEp2uQdXJB+d5Byg=
-        \\-----END CERTIFICATE-----
-    ;
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "MIIBmTCCAUegAwIBAgIBKjAJBgUrDgMCHQUAMBMxETAPBgNVBAMTCEF0bGFudGlz" ++
+        "MB4XDTEyMDcwOTAzMTAzOFoXDTEzMDcwOTAzMTAzN1owEzERMA8GA1UEAxMIQXRs" ++
+        "YW50aXMwXDANBgkqhkiG9w0BAQEFAANLADBIAkEAu+BXo+miabDIHHx+yquqzqNh" ++
+        "Ryn/XtkJIIHVcYtHvIX+S1x5ErgMoHehycpoxbErZmVR4GCq1S2diNmRFZCRtQID" ++
+        "AQABo4GJMIGGMAwGA1UdEwEB/wQCMAAwIAYDVR0EAQH/BBYwFDAOMAwGCisGAQQB" ++
+        "gjcCARUDAgeAMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDAzA1BgNVHQEE" ++
+        "LjAsgBA0jOnSSuIHYmnVryHAdywMoRUwEzERMA8GA1UEAxMIQXRsYW50aXOCASow" ++
+        "CQYFKw4DAh0FAANBAKi6HRBaNEL5R0n56nvfclQNaXiDT174uf+lojzA4lhVInc0" ++
+        "ILwpnZ1izL4MlI9eCSHhVQBHEp2uQdXJB+d5Byg=" ++
+        "-----END CERTIFICATE-----";
 
     var pem = try decode(std.testing.allocator, bytes);
     defer pem.deinit(std.testing.allocator);
@@ -139,21 +138,20 @@ test "ASN.1 type CERTIFICATE" {
 
 test "ASN.1 type CERTIFICATE + Explanatory Text" {
     const bytes =
-        \\Subject: CN=Atlantis
-        \\Issuer: CN=Atlantis
-        \\Validity: from 7/9/2012 3:10:38 AM UTC to 7/9/2013 3:10:37 AM UTC
-        \\-----BEGIN CERTIFICATE-----
-        \\MIIBmTCCAUegAwIBAgIBKjAJBgUrDgMCHQUAMBMxETAPBgNVBAMTCEF0bGFudGlz
-        \\MB4XDTEyMDcwOTAzMTAzOFoXDTEzMDcwOTAzMTAzN1owEzERMA8GA1UEAxMIQXRs
-        \\YW50aXMwXDANBgkqhkiG9w0BAQEFAANLADBIAkEAu+BXo+miabDIHHx+yquqzqNh
-        \\Ryn/XtkJIIHVcYtHvIX+S1x5ErgMoHehycpoxbErZmVR4GCq1S2diNmRFZCRtQID
-        \\AQABo4GJMIGGMAwGA1UdEwEB/wQCMAAwIAYDVR0EAQH/BBYwFDAOMAwGCisGAQQB
-        \\gjcCARUDAgeAMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDAzA1BgNVHQEE
-        \\LjAsgBA0jOnSSuIHYmnVryHAdywMoRUwEzERMA8GA1UEAxMIQXRsYW50aXOCASow
-        \\CQYFKw4DAh0FAANBAKi6HRBaNEL5R0n56nvfclQNaXiDT174uf+lojzA4lhVInc0
-        \\ILwpnZ1izL4MlI9eCSHhVQBHEp2uQdXJB+d5Byg=
-        \\-----END CERTIFICATE-----
-    ;
+        "Subject: CN=Atlantis\n" ++
+        "Issuer: CN=Atlantis\n" ++
+        "Validity: from 7/9/2012 3:10:38 AM UTC to 7/9/2013 3:10:37 AM UTC\n" ++
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "MIIBmTCCAUegAwIBAgIBKjAJBgUrDgMCHQUAMBMxETAPBgNVBAMTCEF0bGFudGlz" ++
+        "MB4XDTEyMDcwOTAzMTAzOFoXDTEzMDcwOTAzMTAzN1owEzERMA8GA1UEAxMIQXRs" ++
+        "YW50aXMwXDANBgkqhkiG9w0BAQEFAANLADBIAkEAu+BXo+miabDIHHx+yquqzqNh" ++
+        "Ryn/XtkJIIHVcYtHvIX+S1x5ErgMoHehycpoxbErZmVR4GCq1S2diNmRFZCRtQID" ++
+        "AQABo4GJMIGGMAwGA1UdEwEB/wQCMAAwIAYDVR0EAQH/BBYwFDAOMAwGCisGAQQB" ++
+        "gjcCARUDAgeAMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDAzA1BgNVHQEE" ++
+        "LjAsgBA0jOnSSuIHYmnVryHAdywMoRUwEzERMA8GA1UEAxMIQXRsYW50aXOCASow" ++
+        "CQYFKw4DAh0FAANBAKi6HRBaNEL5R0n56nvfclQNaXiDT174uf+lojzA4lhVInc0" ++
+        "ILwpnZ1izL4MlI9eCSHhVQBHEp2uQdXJB+d5Byg=" ++
+        "-----END CERTIFICATE-----";
 
     var pem = try decode(std.testing.allocator, bytes);
     defer pem.deinit(std.testing.allocator);
