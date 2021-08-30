@@ -5,9 +5,10 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 /// Convenience type that contains the `AsnType`
-/// and the decoded content of the file.
+/// and the base64 decoded content of the file.
 pub const Pem = struct {
     asn_type: AsnType,
+    /// Decoded content of a PEM file
     content: []const u8,
 
     /// Frees any memory that was allocated during Pem decoding.
