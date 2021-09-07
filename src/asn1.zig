@@ -28,26 +28,31 @@ pub const Tag = enum(u8) {
 /// Represents the value of an element that was encoded using ASN.1 DER encoding rules.
 pub const Value = union(Tag) {
     integer: BigInt, // can represent integers up to 126 bytes.
+    bit_string: struct {
+        data: [*]const u8,
+        len: usize,
+    },
+    octet_string: []const u8,
+    object_identifier: struct {
+        data: [16]u32,
+        len: u5,
+    },
+    utf8_string: []const u8,
+    printable_string: []const u8,
+    ia5_string: []const u8,
+    utc_time: []const u8,
+    generalized_time: []const u8,
+    sequence: []const Value,
+    set: []const Value,
 };
 
-inline fn nextValue(self: *AsnIterator) !?Value {
-    if (self.index >= self.data.len) return null; // reached end of data.
-
-    // Represents the Tag class
-    const Class = enum(u2) {
-        universal,
-        application,
-        context_specific,
-        private,
-    };
-
-    const tag_byte = self.data[self.index];
-    self.index += 1;
-
-    const tag_class = @intToEnum(Class, @intCast(u2, tag_byte >> 6));
-    const tag = @intToEnum(Tag, tag_byte);
-    const length = try findLength(self);
-}
+/// Represents a string which may contain unused bits
+pub const BitString = struct {
+    /// Contains the string as well as the unused bits
+    data: []const u8,
+    /// The total amount of bits of the string
+    bit_length: u8,
+};
 
 /// Decodes ans.1 binary data into Zig types
 pub const Decoder = struct {
@@ -98,6 +103,17 @@ pub const Decoder = struct {
         return self.data[self.index];
     }
 
+    fn decodeTag(self: *Decoder) error{ EndOfData, InvalidTag, ContextSpecific }!Tag {
+        const tag_byte = try self.nextByte();
+        return std.meta.intToEnum(Tag, tag_byte) catch blk: {
+            if (tag_byte & 0xC0 == 0x80) {
+                self.index -= 1;
+                break :blk error.ContextSpecific;
+            }
+            break :blk error.InvalidTag;
+        };
+    }
+
     /// Returns the length of the current element being decoded.
     fn findLength(self: *Decoder) error{InvalidLength}!usize {
         const first_byte = self.data[self.index];
@@ -115,21 +131,78 @@ pub const Decoder = struct {
         self.index += byte_length;
         return length;
     }
-};
 
-test "Decode DER asn.1" {
-    const Certificate = struct {
-        tbs_certificate: TBSCertificate,
-        signature_algorithm: AlgorithmIdentifier,
-        signature_value: []const u8,
-
-        fn decode(self: *Certificate, decoder: *Decoder) !void {
-            self.tbs_certificate = try decoder.decode(TBSCertificate);
-            self.signature_algorithm = try decoder.decode(AlgorithmIdentifier);
-            self.signature_value = try decoder.decodeBitString();
+    /// Decodes the data into a `BitString`
+    pub fn decodeBitString(self: *Decoder) error{ InvalidTag, InvalidLength, EndOfData }!BitString {
+        const tag_byte = try self.nextByte();
+        if (tag_byte != @enumToInt(Tag.bit_string)) {
+            return error.InvalidTag;
         }
+        const length = try self.findLength();
+        const extra_bits = try self.nextByte();
+        const total_bit_length = (length - 1) * 8 - extra_bits;
+        const string_length = std.math.divCeil(usize, total_bit_length, 8) catch unreachable;
+        const string = self.data[self.index..][0..string_length];
+        self.index += length;
+        return BitString{ .data = string, .bit_length = total_bit_length };
+    }
+
+    /// Decodes the data into the given string tag.
+    /// If the expected data contains a bit string, use `decodeBitString`.
+    pub fn decodeString(self: *Decoder, tag: Tag) error{ InvalidTag, InvalidLength, EndOfData }![]const u8 {
+        std.debug.assert(switch (tag) {
+            .octet_string, .ia5_string, .utf8_string, .printable_string => false,
+            else => true,
+        }); // Given `Tag` is not a valid string tag
+        const tag_byte = try self.nextByte();
+        if (tag_byte != @enumToInt(tag)) {
+            return error.InvalidTag;
+        }
+        const length = try self.findLength();
+        defer self.index += length;
+        return self.data[self.index..][0..length];
+    }
+
+    pub fn decodeInt(self: *Decoder) !BigInt {
+        const tag = try self.decodeTag();
+        if (tag != .integer) return error.InvalidTag;
+    }
+
+    const ContextSpecificOptions = struct {
+        specificity: enum { optional },
+        decodeFn: anytype,
     };
 
+    pub fn decodeContextSpecific(
+        self: *Decoder,
+        comptime options: ContextSpecificOptions,
+    ) !ReturnType(@TypeOf(options.decodeFn)) {
+        _ = self;
+    }
+};
+
+fn ReturnType(comptime T: type) type {
+    return @typeInfo(T).Fn.ReturnType;
+}
+
+test "Decode DER asn.1" {
+    const AlgorithmIdentifier = struct {
+        algorithm: u32,
+        parameters: ?[]const u8,
+    };
+    const Extension = struct {
+        extn_id: []const u8,
+        critical: bool,
+        extn_value: []const u8,
+    };
+    const Validity = struct {
+        not_before: i64,
+        not_after: i64,
+    };
+    const SubjectPublicKeyInfo = struct {
+        algorithm: AlgorithmIdentifier,
+        subject_public_key: []const u8,
+    };
     const TBSCertificate = struct {
         version: u2,
         serial_number: u32,
@@ -142,21 +215,18 @@ test "Decode DER asn.1" {
         subject_unique_id: ?[]const u8,
         extensions: []const Extension,
     };
+    const Certificate = struct {
+        tbs_certificate: TBSCertificate,
+        signature_algorithm: AlgorithmIdentifier,
+        signature_value: BitString,
 
-    const Extension = struct {
-        extn_id: []const u8,
-        critical: bool,
-        extn_value: []const u8,
-    };
+        const Cert = @This();
 
-    const Validity = struct {
-        not_before: i64,
-        not_after: i64,
-    };
-
-    const AlgorithmIdentifier = struct {
-        algorithm: u32,
-        parameters: ?[]const u8,
+        fn decode(self: *Cert, decoder: *Decoder) !void {
+            self.tbs_certificate = try decoder.decode(TBSCertificate);
+            self.signature_algorithm = try decoder.decode(AlgorithmIdentifier);
+            self.signature_value = try decoder.decodeBitString();
+        }
     };
 
     var decoder = Decoder.init("");
