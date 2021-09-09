@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const Allocator = mem.Allocator;
 const BigInt = std.math.big.int.Const;
 
 /// A subset of ASN.1 tag types as specified by the spec.
@@ -61,10 +62,14 @@ pub const Decoder = struct {
     index: usize,
     /// The ans.1 binary data that is being decoded by the current instance.
     data: []const u8,
+    /// Allocator is used to allocate memory for limbs (as we must swap them due to endianness),
+    /// as well as allocate a Value for sets and sequences.
+    /// Memory can be freed easily by calling `deinit` on a `Value`.
+    gpa: *Allocator,
 
     /// Initializes a new decoder instance for the given binary data.
-    pub fn init(data: []const u8) Decoder {
-        return .{ .index = 0, .data = data };
+    pub fn init(gpa: *Allocator, data: []const u8) Decoder {
+        return .{ .index = 0, .data = data, .gpa = gpa };
     }
 
     /// Decodes the binary data into given type `T`.
@@ -163,9 +168,60 @@ pub const Decoder = struct {
         return self.data[self.index..][0..length];
     }
 
+    /// Decodes an integer value, while allocating the memory for the limbs
+    /// as we must ensure the endianness is correct.
+    /// BigInt expects LE bytes, whereas certificates are BE.
     pub fn decodeInt(self: *Decoder) !BigInt {
         const tag = try self.decodeTag();
         if (tag != .integer) return error.InvalidTag;
+        const length = try self.findLength();
+
+        const byte = try self.nextByte();
+        const is_positive = byte == 0x00 and length > 1;
+        const actual_length = length - @boolToInt(is_positive);
+
+        const limb_count = std.math.divCeil(usize, actual_length, @sizeOf(usize)) catch unreachable;
+        const limb_bytes = try self.gpa.dupe(u8, self.data[self.index..][0..actual_length]);
+        mem.reverse(u8, &limb_bytes);
+        self.index += length;
+
+        if (!is_positive) {
+            limb_bytes[0] = byte & ~@as(u8, 0x80);
+        }
+
+        return BigInt{
+            .limbs = @ptrCast([*]usize, limb_bytes.ptr)[0..limb_count],
+            .positive = is_positive or (byte & 0x80) == 0x00,
+        };
+    }
+
+    /// Decodes data into an object identifier
+    pub fn decodeObjectIdentifier(self: *Decoder) !Value {
+        const length = try self.findLength();
+        const initial_byte = try self.nextByte();
+        var identifier = Value{ .object_identifier = .{ .data = undefined, .len = 0 } };
+        identifier.object_identifier.data[0] = initial_byte / 40;
+        identifier.object_identifier.data[0] = initial_byte % 40;
+
+        var out_idx: u8 = 2;
+        var index: usize = 0;
+        while (index < length - 1) {
+            var current: u32 = 0;
+            var current_byte = try self.nextByte();
+            index += 1;
+            while (current_byte & 0x80 == 0x80) : (index += 1) {
+                current *= 128;
+                current += @as(u32, current_byte & ~@as(u8, 0x80)) * 128;
+                current_byte += current_byte;
+            } else {
+                current += current_byte;
+            }
+            identifier.object_identifier.data[out_idx] = current;
+            out_idx += 1;
+        }
+        identifier.object_identifier.len = out_idx;
+        self.index += length;
+        return identifier;
     }
 
     const ContextSpecificOptions = struct {
@@ -220,9 +276,7 @@ test "Decode DER asn.1" {
         signature_algorithm: AlgorithmIdentifier,
         signature_value: BitString,
 
-        const Cert = @This();
-
-        fn decode(self: *Cert, decoder: *Decoder) !void {
+        fn decode(self: *@This(), decoder: *Decoder) !void {
             self.tbs_certificate = try decoder.decode(TBSCertificate);
             self.signature_algorithm = try decoder.decode(AlgorithmIdentifier);
             self.signature_value = try decoder.decodeBitString();
