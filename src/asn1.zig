@@ -24,6 +24,7 @@ pub const Tag = enum(u8) {
     generalized_time = 0x18,
     sequence = 0x30,
     set = 0x31,
+    _,
 };
 
 /// Represents the value of an element that was encoded using ASN.1 DER encoding rules.
@@ -42,9 +43,31 @@ pub const Value = union(Tag) {
     printable_string: []const u8,
     ia5_string: []const u8,
     utc_time: []const u8,
-    generalized_time: []const u8,
     sequence: []const Value,
     set: []const Value,
+    context: struct {
+        value: *const Value,
+        id: u8,
+    },
+
+    /// Frees any memory that was allocated while constructed
+    /// a given `Value`
+    pub fn deinit(self: Value, gpa: *Allocator) void {
+        switch (self) {
+            .integer => |int| gpa.free(int.limbs),
+            .sequence => |seq| for (seq) |val| {
+                val.deinit(gpa);
+            } else gpa.free(seq),
+            .set => |set| for (set) |val| {
+                val.deinit(gpa);
+            } else gpa.free(set),
+            .context => |ctx| {
+                ctx.value.deinit(gpa);
+                gpa.destroy(ctx);
+            },
+            else => {},
+        }
+    }
 };
 
 /// Represents a string which may contain unused bits
@@ -72,32 +95,43 @@ pub const Decoder = struct {
         return .{ .index = 0, .data = data, .gpa = gpa };
     }
 
-    /// Decodes the binary data into given type `T`.
-    /// Will call the `decode` declaration on the given type, and therefore
-    /// requires the struct type to have a `decode` method with a pointer
-    /// to itself and a pointer to a `Decode` instance like e.g.
-    ///
-    /// fn (self: *T, decoder: *Decoder) !void
-    pub fn decode(self: Decoder, comptime T: type) !T {
-        if (@typeInfo(T) != .Struct) {
-            @compileError("Type " ++ @typeName(T) ++ " must be a struct type.");
-        }
-        if (!comptime std.meta.trait.hasFn("decode")(T)) {
-            @compileError("Type " ++ @typeName(T) ++ " has no 'decode' declaration.");
-        }
-        var value: T = undefined;
+    /// Decodes from the current index into `data` and returns
+    /// a `Value`
+    pub fn decode(self: Decoder) !Value {
+        const tag = self.decodeTag() catch |err| switch (err) {
+            error.ContextSpecific => {
+                const tag_byte = try self.nextByte();
+                const length = try self.findLength();
+                const current_index = self.index;
+                const context = try self.gpa.create(Value);
+                errdefer self.gpa.destroy(context);
 
-        const tag_byte = try self.nextByte();
-        if (tag_byte != @enumToInt(Tag.sequence)) {
-            return error.UnexpectedTag;
-        }
-        const expected_length = try self.findLength();
-        const current_index = self.index;
-        try value.decode(self);
-
-        if (expected_length != self.index - current_index) {
-            return error.MismatchingLength;
-        }
+                context.* = try self.decode();
+                if (self.index - current_index != length) {
+                    return error.InvalidLength;
+                }
+                return Value{ .context = .{ .value = context, .id = tag_byte - 0xa0 } };
+            },
+            else => |e| return e,
+        };
+        return switch (tag) {
+            .bit_string => Value{ .bit_string = try self.decodeBitString() },
+            .integer => Value{.integer > try self.decodeInt()},
+            .octet_string, .ia5_string, .utf8_string, .printable_string => {
+                const string_value = try self.decodeString();
+                return @as(Value, switch (tag) {
+                    .octet_string => .{ .octet_string = string_value },
+                    .ia5_string => .{ .ia5_string = string_value },
+                    .utf8_string => .{ .utf8_string = string_value },
+                    .printable_string => .{ .printable_string = string_value },
+                    .utc_time => .{ .utc_time = string_value },
+                    else => unreachable,
+                });
+            },
+            .object_identifier => Value{ .object_identifier = try self.decodeObjectIdentifier() },
+            .sequence, .set => try self.decodeSequence(tag),
+            else => unreachable, // unsupported tags are caught by decodeTag()
+        };
     }
 
     /// Reads the next byte from the data and increments the index.
@@ -138,7 +172,7 @@ pub const Decoder = struct {
     }
 
     /// Decodes the data into a `BitString`
-    pub fn decodeBitString(self: *Decoder) error{ InvalidTag, InvalidLength, EndOfData }!BitString {
+    pub fn decodeBitString(self: *Decoder) !BitString {
         const tag_byte = try self.nextByte();
         if (tag_byte != @enumToInt(Tag.bit_string)) {
             return error.InvalidTag;
@@ -154,15 +188,7 @@ pub const Decoder = struct {
 
     /// Decodes the data into the given string tag.
     /// If the expected data contains a bit string, use `decodeBitString`.
-    pub fn decodeString(self: *Decoder, tag: Tag) error{ InvalidTag, InvalidLength, EndOfData }![]const u8 {
-        std.debug.assert(switch (tag) {
-            .octet_string, .ia5_string, .utf8_string, .printable_string => false,
-            else => true,
-        }); // Given `Tag` is not a valid string tag
-        const tag_byte = try self.nextByte();
-        if (tag_byte != @enumToInt(tag)) {
-            return error.InvalidTag;
-        }
+    pub fn decodeString(self: *Decoder) ![]const u8 {
         const length = try self.findLength();
         defer self.index += length;
         return self.data[self.index..][0..length];
@@ -224,66 +250,24 @@ pub const Decoder = struct {
         return identifier;
     }
 
-    const ContextSpecificOptions = struct {
-        specificity: enum { optional },
-        decodeFn: anytype,
-    };
+    pub fn decodeSequence(self: *Decoder, tag: Tag) !Value {
+        const length = try self.findLength();
+        var value_list = std.ArrayList(Value).init(self.gpa);
+        errdefer for (value_list.items) |val| {
+            val.deinit(self.gpa);
+        } else value_list.deinit();
 
-    pub fn decodeContextSpecific(
-        self: *Decoder,
-        comptime options: ContextSpecificOptions,
-    ) !ReturnType(@TypeOf(options.decodeFn)) {
-        _ = self;
+        while (self.index < length) {
+            const value = try value_list.addOne();
+            value.* = try self.decode();
+        }
+
+        const final_list = value_list.toOwnedSlice();
+        return switch (tag) {
+            .sequence => Value{ .sequence = final_list },
+            .set => Value{ .sequence = final_list },
+        };
     }
 };
 
-fn ReturnType(comptime T: type) type {
-    return @typeInfo(T).Fn.ReturnType;
-}
-
-test "Decode DER asn.1" {
-    const AlgorithmIdentifier = struct {
-        algorithm: u32,
-        parameters: ?[]const u8,
-    };
-    const Extension = struct {
-        extn_id: []const u8,
-        critical: bool,
-        extn_value: []const u8,
-    };
-    const Validity = struct {
-        not_before: i64,
-        not_after: i64,
-    };
-    const SubjectPublicKeyInfo = struct {
-        algorithm: AlgorithmIdentifier,
-        subject_public_key: []const u8,
-    };
-    const TBSCertificate = struct {
-        version: u2,
-        serial_number: u32,
-        signature: AlgorithmIdentifier,
-        issuer: []const u8,
-        validity: Validity,
-        subject: []const u8,
-        subject_public_key_info: SubjectPublicKeyInfo,
-        issuer_unique_id: ?[]const u8,
-        subject_unique_id: ?[]const u8,
-        extensions: []const Extension,
-    };
-    const Certificate = struct {
-        tbs_certificate: TBSCertificate,
-        signature_algorithm: AlgorithmIdentifier,
-        signature_value: BitString,
-
-        fn decode(self: *@This(), decoder: *Decoder) !void {
-            self.tbs_certificate = try decoder.decode(TBSCertificate);
-            self.signature_algorithm = try decoder.decode(AlgorithmIdentifier);
-            self.signature_value = try decoder.decodeBitString();
-        }
-    };
-
-    var decoder = Decoder.init("");
-    const certificate = try decoder.decode(Certificate);
-    _ = certificate;
-}
+test "Decode int" {}
