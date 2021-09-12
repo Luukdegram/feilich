@@ -207,23 +207,28 @@ pub const Decoder = struct {
     /// BigInt expects LE bytes, whereas certificates are BE.
     pub fn decodeInt(self: *Decoder) !BigInt {
         const length = try self.findLength();
-
         const byte = try self.nextByte();
         const is_positive = byte == 0x00 and length > 1;
         const actual_length = length - @boolToInt(is_positive);
 
         const limb_count = std.math.divCeil(usize, actual_length, @sizeOf(usize)) catch unreachable;
-        const limb_bytes = try self.gpa.dupe(u8, self.data[self.index..][0..actual_length]);
-        mem.reverse(u8, limb_bytes);
-        self.index += length;
+        const limbs = try self.gpa.alloc(usize, limb_count);
+        errdefer self.gpa.free(limbs);
+        mem.set(usize, limbs, 0);
 
-        if (!is_positive) {
+        const limb_bytes = @ptrCast([*]u8, limbs.ptr)[0..actual_length];
+        if (is_positive) {
+            mem.copy(u8, limb_bytes, self.data[self.index..][0..actual_length]);
+        } else {
+            mem.copy(u8, limb_bytes[1..], self.data[self.index - 1 ..][1..actual_length]);
             limb_bytes[0] = byte & ~@as(u8, 0x80);
         }
 
+        mem.reverse(u8, limb_bytes);
+        self.index += length - 1;
         return BigInt{
-            .limbs = @ptrCast([*]usize, @alignCast(@alignOf([*]usize), limb_bytes.ptr))[0..limb_count],
-            .positive = is_positive or (byte & 0x80) == 0x00,
+            .limbs = limbs,
+            .positive = is_positive or byte & 0x80 == 0x00,
         };
     }
 
@@ -233,7 +238,7 @@ pub const Decoder = struct {
         const initial_byte = try self.nextByte();
         var identifier = Value{ .object_identifier = .{ .data = undefined, .len = 0 } };
         identifier.object_identifier.data[0] = initial_byte / 40;
-        identifier.object_identifier.data[0] = initial_byte % 40;
+        identifier.object_identifier.data[1] = initial_byte % 40;
 
         var out_idx: u5 = 2;
         var index: usize = 0;
@@ -244,7 +249,7 @@ pub const Decoder = struct {
             while (current_byte & 0x80 == 0x80) : (index += 1) {
                 current *= 128;
                 current += @as(u32, current_byte & ~@as(u8, 0x80)) * 128;
-                current_byte += current_byte;
+                current_byte = try self.nextByte();
             } else {
                 current += current_byte;
             }
@@ -256,6 +261,8 @@ pub const Decoder = struct {
         return identifier;
     }
 
+    /// Decodes either a sequence of/set of into a `Value`
+    /// Allocates memory for the list of `Value`.
     pub fn decodeSequence(self: *Decoder, tag: Tag) !Value {
         const length = try self.findLength();
         var value_list = std.ArrayList(Value).init(self.gpa);
@@ -264,8 +271,9 @@ pub const Decoder = struct {
         } else value_list.deinit();
 
         while (self.index < length) {
-            const value = try value_list.addOne();
-            value.* = try self.decode();
+            const value = try self.decode();
+            errdefer value.deinit(self.gpa);
+            try value_list.append(value);
         }
 
         const final_list = value_list.toOwnedSlice();
@@ -277,12 +285,58 @@ pub const Decoder = struct {
     }
 };
 
-test "Decode int" {}
+test "Decode int" {
+    const bytes: []const u8 = &.{ 0x02, 0x09, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, (1 << 63) + 1), try value.integer.to(u64));
+}
 
 test "Octet string" {
-    var bytes: []const u8 = &.{ 0x04, 0x04, 0x03, 0x02, 0x06, 0xA0 };
+    const bytes: []const u8 = &.{ 0x04, 0x04, 0x03, 0x02, 0x06, 0xA0 };
     var decoder = Decoder.init(testing.allocator, bytes);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqualSlices(u8, bytes[2..], value.octet_string);
+}
+
+test "Object identifier" {
+    const bytes: []const u8 = &.{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+    try testing.expectEqual(@as(u5, 7), value.object_identifier.len);
+    try testing.expectEqualSlices(u32, &.{
+        1, 2, 840, 113549, 1, 1, 11,
+    }, value.object_identifier.data[0..value.object_identifier.len]);
+}
+
+test "Printable string" {
+    const bytes: []const u8 = &.{ 0x13, 0x02, 0x68, 0x69 };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+    try testing.expectEqualStrings("hi", value.printable_string);
+}
+
+test "Utf8 string" {
+    const bytes: []const u8 = &.{ 0x0c, 0x04, 0xf0, 0x9f, 0x98, 0x8e };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+    try testing.expectEqualStrings("😎", value.utf8_string);
+}
+
+test "Sequence of" {
+    const bytes: []const u8 = &.{ 0x30, 0x09, 0x02, 0x01, 0x07, 0x02, 0x01, 0x08, 0x02, 0x01, 0x09 };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+
+    const expected: []const u8 = &.{ 7, 8, 9 };
+    try testing.expectEqual(expected.len, value.sequence.len);
+    for (expected) |expected_value, index| {
+        try testing.expectEqual(expected_value, try value.sequence[index].integer.to(u8));
+    }
 }
