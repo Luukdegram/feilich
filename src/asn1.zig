@@ -7,9 +7,10 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const BigInt = std.math.big.int.Const;
+const testing = std.testing;
 
 /// A subset of ASN.1 tag types as specified by the spec.
-/// We only define the tags that are required for https.
+/// We only define the tags that are required for PEM certificates.
 /// Read more at:
 /// https://datatracker.ietf.org/doc/html/rfc5280#section-4.1
 pub const Tag = enum(u8) {
@@ -21,19 +22,16 @@ pub const Tag = enum(u8) {
     printable_string = 0x13,
     ia5_string = 0x16,
     utc_time = 0x17,
-    generalized_time = 0x18,
     sequence = 0x30,
     set = 0x31,
+    context = 255, // Used by decoder, but is not a valid Tag.
     _,
 };
 
 /// Represents the value of an element that was encoded using ASN.1 DER encoding rules.
 pub const Value = union(Tag) {
     integer: BigInt, // can represent integers up to 126 bytes.
-    bit_string: struct {
-        data: [*]const u8,
-        len: usize,
-    },
+    bit_string: BitString,
     octet_string: []const u8,
     object_identifier: struct {
         data: [16]u32,
@@ -63,7 +61,7 @@ pub const Value = union(Tag) {
             } else gpa.free(set),
             .context => |ctx| {
                 ctx.value.deinit(gpa);
-                gpa.destroy(ctx);
+                gpa.destroy(ctx.value);
             },
             else => {},
         }
@@ -90,6 +88,16 @@ pub const Decoder = struct {
     /// Memory can be freed easily by calling `deinit` on a `Value`.
     gpa: *Allocator,
 
+    pub const Error = error{
+        /// Tag found is either not supported or incorrect
+        InvalidTag,
+        OutOfMemory,
+        /// Index has reached the end of `data`'s size
+        EndOfData,
+        /// The length could not be decoded and is malformed
+        InvalidLength,
+    };
+
     /// Initializes a new decoder instance for the given binary data.
     pub fn init(gpa: *Allocator, data: []const u8) Decoder {
         return .{ .index = 0, .data = data, .gpa = gpa };
@@ -97,7 +105,7 @@ pub const Decoder = struct {
 
     /// Decodes from the current index into `data` and returns
     /// a `Value`
-    pub fn decode(self: Decoder) !Value {
+    pub fn decode(self: *Decoder) Error!Value {
         const tag = self.decodeTag() catch |err| switch (err) {
             error.ContextSpecific => {
                 const tag_byte = try self.nextByte();
@@ -116,7 +124,7 @@ pub const Decoder = struct {
         };
         return switch (tag) {
             .bit_string => Value{ .bit_string = try self.decodeBitString() },
-            .integer => Value{.integer > try self.decodeInt()},
+            .integer => Value{ .integer = try self.decodeInt() },
             .octet_string, .ia5_string, .utf8_string, .printable_string => {
                 const string_value = try self.decodeString();
                 return @as(Value, switch (tag) {
@@ -128,7 +136,7 @@ pub const Decoder = struct {
                     else => unreachable,
                 });
             },
-            .object_identifier => Value{ .object_identifier = try self.decodeObjectIdentifier() },
+            .object_identifier => try self.decodeObjectIdentifier(),
             .sequence, .set => try self.decodeSequence(tag),
             else => unreachable, // unsupported tags are caught by decodeTag()
         };
@@ -183,7 +191,7 @@ pub const Decoder = struct {
         const string_length = std.math.divCeil(usize, total_bit_length, 8) catch unreachable;
         const string = self.data[self.index..][0..string_length];
         self.index += length;
-        return BitString{ .data = string, .bit_length = total_bit_length };
+        return BitString{ .data = string, .bit_length = @intCast(u8, total_bit_length) };
     }
 
     /// Decodes the data into the given string tag.
@@ -198,8 +206,6 @@ pub const Decoder = struct {
     /// as we must ensure the endianness is correct.
     /// BigInt expects LE bytes, whereas certificates are BE.
     pub fn decodeInt(self: *Decoder) !BigInt {
-        const tag = try self.decodeTag();
-        if (tag != .integer) return error.InvalidTag;
         const length = try self.findLength();
 
         const byte = try self.nextByte();
@@ -208,7 +214,7 @@ pub const Decoder = struct {
 
         const limb_count = std.math.divCeil(usize, actual_length, @sizeOf(usize)) catch unreachable;
         const limb_bytes = try self.gpa.dupe(u8, self.data[self.index..][0..actual_length]);
-        mem.reverse(u8, &limb_bytes);
+        mem.reverse(u8, limb_bytes);
         self.index += length;
 
         if (!is_positive) {
@@ -216,7 +222,7 @@ pub const Decoder = struct {
         }
 
         return BigInt{
-            .limbs = @ptrCast([*]usize, limb_bytes.ptr)[0..limb_count],
+            .limbs = @ptrCast([*]usize, @alignCast(@alignOf([*]usize), limb_bytes.ptr))[0..limb_count],
             .positive = is_positive or (byte & 0x80) == 0x00,
         };
     }
@@ -229,7 +235,7 @@ pub const Decoder = struct {
         identifier.object_identifier.data[0] = initial_byte / 40;
         identifier.object_identifier.data[0] = initial_byte % 40;
 
-        var out_idx: u8 = 2;
+        var out_idx: u5 = 2;
         var index: usize = 0;
         while (index < length - 1) {
             var current: u32 = 0;
@@ -266,8 +272,17 @@ pub const Decoder = struct {
         return switch (tag) {
             .sequence => Value{ .sequence = final_list },
             .set => Value{ .sequence = final_list },
+            else => unreachable,
         };
     }
 };
 
 test "Decode int" {}
+
+test "Octet string" {
+    var bytes: []const u8 = &.{ 0x04, 0x04, 0x03, 0x02, 0x06, 0xA0 };
+    var decoder = Decoder.init(testing.allocator, bytes);
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, bytes[2..], value.octet_string);
+}
