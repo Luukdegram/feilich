@@ -24,7 +24,7 @@ pub const Tag = enum(u8) {
     utc_time = 0x17,
     sequence = 0x30,
     set = 0x31,
-    context = 255, // Used by decoder, but is not a valid Tag.
+    // context = 255, // Used by decoder, but is not a valid Tag.
     _,
 };
 
@@ -43,10 +43,10 @@ pub const Value = union(Tag) {
     utc_time: []const u8,
     sequence: []const Value,
     set: []const Value,
-    context: struct {
-        value: *const Value,
-        id: u8,
-    },
+    // context: struct {
+    //     value: *const Value,
+    //     id: u8,
+    // },
 
     /// Frees any memory that was allocated while constructed
     /// a given `Value`
@@ -59,10 +59,10 @@ pub const Value = union(Tag) {
             .set => |set| for (set) |val| {
                 val.deinit(gpa);
             } else gpa.free(set),
-            .context => |ctx| {
-                ctx.value.deinit(gpa);
-                gpa.destroy(ctx.value);
-            },
+            // .context => |ctx| {
+            //     ctx.value.deinit(gpa);
+            //     gpa.destroy(ctx.value);
+            // },
             else => {},
         }
     }
@@ -76,12 +76,34 @@ pub const BitString = struct {
     bit_length: u8,
 };
 
+/// Kind is a union representing each individual element
+/// within a schema as to what is expected from the encoded
+/// data and how to interpret the data. This allows us
+/// to successfully decode asn.1 data that requires information
+/// from outside what's available within the data itself.
+pub const Kind = union(enum) {
+    tag: Tag,
+    context_specific: struct {
+        id: u8,
+        tag: ?Tag,
+        callback: ?fn (decoder: *Decoder) Decoder.Error!Value,
+    },
+    none,
+};
+
+/// Represents a series of asn.1 elements, where each
+/// `Kind` describes how to decode the next element.
+/// This is required in cases where the data is ambigious,
+/// such as context specific or optional data and the data describing
+/// the Tag of the element is omitted.
+pub const Schema = []const Kind;
+
 /// Decodes ans.1 binary data into Zig types
 pub const Decoder = struct {
     /// Internal index into the data.
     /// Should not be tempered with outside the Decoder.
     index: usize,
-    /// The ans.1 binary data that is being decoded by the current instance.
+    /// The asn.1 binary data that is being decoded by the current instance.
     data: []const u8,
     /// Allocator is used to allocate memory for limbs (as we must swap them due to endianness),
     /// as well as allocate a Value for sets and sequences.
@@ -96,6 +118,11 @@ pub const Decoder = struct {
         EndOfData,
         /// The length could not be decoded and is malformed
         InvalidLength,
+        /// The encoded data contains context specific data,
+        /// meaning we cannot infer the Tag without knowing the context.
+        /// Use `usingSchema` to define a context and tell the decoder
+        /// how to decode the given data.
+        ContextSpecific,
     };
 
     /// Initializes a new decoder instance for the given binary data.
@@ -153,8 +180,7 @@ pub const Decoder = struct {
     fn decodeTag(self: *Decoder) error{ EndOfData, InvalidTag, ContextSpecific }!Tag {
         const tag_byte = try self.nextByte();
         return std.meta.intToEnum(Tag, tag_byte) catch blk: {
-            if (tag_byte & 0xC0 == 0x80) {
-                self.index -= 1;
+            if (tag_byte & 0x80 == 0x80) {
                 break :blk error.ContextSpecific;
             }
             break :blk error.InvalidTag;
