@@ -43,10 +43,6 @@ pub const Value = union(Tag) {
     utc_time: []const u8,
     sequence: []const Value,
     set: []const Value,
-    // context: struct {
-    //     value: *const Value,
-    //     id: u8,
-    // },
 
     /// Frees any memory that was allocated while constructed
     /// a given `Value`
@@ -59,10 +55,6 @@ pub const Value = union(Tag) {
             .set => |set| for (set) |val| {
                 val.deinit(gpa);
             } else gpa.free(set),
-            // .context => |ctx| {
-            //     ctx.value.deinit(gpa);
-            //     gpa.destroy(ctx.value);
-            // },
             else => {},
         }
     }
@@ -82,12 +74,20 @@ pub const BitString = struct {
 /// to successfully decode asn.1 data that requires information
 /// from outside what's available within the data itself.
 pub const Kind = union(enum) {
+    /// A regular element that should not be ignored,
+    /// is mandatory, but does not require special casing.
     tag: Tag,
+    /// The element could be an optional or context specific.
+    /// Will decode the element according to the given `Tag`,
+    /// if the id matches the upper bits of the tag byte.
+    /// When the id does not match, the element will be ignored.
     context_specific: struct {
         id: u8,
-        tag: ?Tag,
-        callback: ?fn (decoder: *Decoder) Decoder.Error!Value,
+        tag: Tag,
     },
+    /// Allows the user how to decode the choice
+    choice: fn (decoder: *Decoder, id: u8) Decoder.Error!Value,
+    /// When the element can be ignored
     none,
 };
 
@@ -109,6 +109,13 @@ pub const Decoder = struct {
     /// as well as allocate a Value for sets and sequences.
     /// Memory can be freed easily by calling `deinit` on a `Value`.
     gpa: *Allocator,
+    /// A `Schema` is used to provide a list of ordered elements that tell
+    /// the decoder how to decode each individual element, allowing the decoder
+    /// to handle context-specific elements.
+    schema: ?Schema,
+    /// The index into `schema` to determine which element is being decoded.
+    /// The field is not used when `schema` is `null`.
+    schema_index: usize,
 
     pub const Error = error{
         /// Tag found is either not supported or incorrect
@@ -125,30 +132,69 @@ pub const Decoder = struct {
         ContextSpecific,
     };
 
+    const DecodeOptions = union(enum) {
+        no_schema,
+        with_schema: Schema,
+    };
+
     /// Initializes a new decoder instance for the given binary data.
-    pub fn init(gpa: *Allocator, data: []const u8) Decoder {
-        return .{ .index = 0, .data = data, .gpa = gpa };
+    /// Allows the caller to provide a `Schema` which represents the
+    /// layout of the encoded data and tells the decoder how it must be decoded.
+    ///
+    /// Provide `.no_schema` when the data is 'simple' and requires no context-specific handling.
+    pub fn init(gpa: *Allocator, data: []const u8, options: DecodeOptions) Decoder {
+        return .{
+            .index = 0,
+            .data = data,
+            .gpa = gpa,
+            .schema = if (options == .no_schema) null else options.with_schema,
+            .schema_index = 0,
+        };
+    }
+
+    /// Decodes the data, interpreting it as the given `Tag`.
+    /// The decoder still verifies if the given tag is a valid tag according
+    /// to the found tag-byte.
+    pub fn decodeTag(self: *Decoder, tag: Tag) Error!Value {
+        return try self.decodeMaybeTag(tag);
     }
 
     /// Decodes from the current index into `data` and returns
-    /// a `Value`
+    /// a `Value`, representing a type based on the tag found
+    /// in the encoded data.
     pub fn decode(self: *Decoder) Error!Value {
-        const tag = self.decodeTag() catch |err| switch (err) {
-            error.ContextSpecific => {
-                const tag_byte = try self.nextByte();
-                const length = try self.findLength();
-                const current_index = self.index;
-                const context = try self.gpa.create(Value);
-                errdefer self.gpa.destroy(context);
+        return self.decodeMaybeTag(null);
+    }
 
-                context.* = try self.decode();
-                if (self.index - current_index != length) {
-                    return error.InvalidLength;
+    fn decodeMaybeTag(self: *Decoder, maybe_tag: ?Tag) Error!Value {
+        const tag_byte = try self.nextByte();
+        const tag = std.meta.intToEnum(Tag, tag_byte) catch blk: {
+            if (tag_byte & 0x80 == 0x80) {
+                if (maybe_tag) |wanted_tag| break :blk wanted_tag;
+
+                if (self.element()) |kind| {
+                    switch (kind) {
+                        .context_specific => |ctx| {
+                            const id = @truncate(u3, tag_byte);
+                            if (id == ctx.id) {
+                                break :blk ctx.tag;
+                            }
+                            return error.InvalidTag;
+                        },
+                        .choice => |callback| {
+                            // decrease index to make the tag byte available again to the callback
+                            self.index -= 1;
+                            return callback(self, @truncate(u3, tag_byte));
+                        },
+                        else => return error.InvalidTag,
+                    }
                 }
-                return Value{ .context = .{ .value = context, .id = tag_byte - 0xa0 } };
-            },
-            else => |e| return e,
+                return error.ContextSpecific;
+            }
+            return error.InvalidTag;
         };
+        self.maybeAdvanceElement();
+
         return switch (tag) {
             .bit_string => Value{ .bit_string = try self.decodeBitString() },
             .integer => Value{ .integer = try self.decodeInt() },
@@ -165,7 +211,7 @@ pub const Decoder = struct {
             },
             .object_identifier => try self.decodeObjectIdentifier(),
             .sequence, .set => try self.decodeSequence(tag),
-            else => unreachable, // unsupported tags are caught by decodeTag()
+            else => unreachable,
         };
     }
 
@@ -177,14 +223,24 @@ pub const Decoder = struct {
         return self.data[self.index];
     }
 
-    fn decodeTag(self: *Decoder) error{ EndOfData, InvalidTag, ContextSpecific }!Tag {
-        const tag_byte = try self.nextByte();
-        return std.meta.intToEnum(Tag, tag_byte) catch blk: {
-            if (tag_byte & 0x80 == 0x80) {
-                break :blk error.ContextSpecific;
-            }
-            break :blk error.InvalidTag;
-        };
+    /// Returns the current element `Kind`.
+    /// Will return `null` when no schema was set, or no element
+    /// is present at the current index.
+    ///
+    /// Note: This does no bound-checking to verify the index advances
+    /// past the length of elements. However, `element()` does verify this.
+    fn element(self: *Decoder) ?Kind {
+        if (self.schema) |schema| {
+            if (self.schema_index >= schema.len) return null;
+            return schema[self.schema_index];
+        }
+        return null;
+    }
+
+    /// When a `Schema` was set on the `Decoder`, this will
+    /// advance the index, allowing us to retrieve the next element's `Kind`
+    fn maybeAdvanceElement(self: *Decoder) void {
+        self.schema_index += @boolToInt(self.schema != null);
     }
 
     /// Returns the length of the current element being decoded.
@@ -313,7 +369,7 @@ pub const Decoder = struct {
 
 test "Decode int" {
     const bytes: []const u8 = &.{ 0x02, 0x09, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, (1 << 63) + 1), try value.integer.to(u64));
@@ -321,7 +377,7 @@ test "Decode int" {
 
 test "Octet string" {
     const bytes: []const u8 = &.{ 0x04, 0x04, 0x03, 0x02, 0x06, 0xA0 };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqualSlices(u8, bytes[2..], value.octet_string);
@@ -329,7 +385,7 @@ test "Octet string" {
 
 test "Object identifier" {
     const bytes: []const u8 = &.{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqual(@as(u5, 7), value.object_identifier.len);
@@ -340,7 +396,7 @@ test "Object identifier" {
 
 test "Printable string" {
     const bytes: []const u8 = &.{ 0x13, 0x02, 0x68, 0x69 };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqualStrings("hi", value.printable_string);
@@ -348,7 +404,7 @@ test "Printable string" {
 
 test "Utf8 string" {
     const bytes: []const u8 = &.{ 0x0c, 0x04, 0xf0, 0x9f, 0x98, 0x8e };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
     try testing.expectEqualStrings("😎", value.utf8_string);
@@ -356,7 +412,7 @@ test "Utf8 string" {
 
 test "Sequence of" {
     const bytes: []const u8 = &.{ 0x30, 0x09, 0x02, 0x01, 0x07, 0x02, 0x01, 0x08, 0x02, 0x01, 0x09 };
-    var decoder = Decoder.init(testing.allocator, bytes);
+    var decoder = Decoder.init(testing.allocator, bytes, .no_schema);
     const value = try decoder.decode();
     defer value.deinit(testing.allocator);
 
@@ -365,4 +421,31 @@ test "Sequence of" {
     for (expected) |expected_value, index| {
         try testing.expectEqual(expected_value, try value.sequence[index].integer.to(u8));
     }
+}
+
+test "Choice" {
+    const bytes: []const u8 = &.{ 0x82, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d };
+
+    const callback = struct {
+        fn decode(decoder: *Decoder, id: u8) Decoder.Error!Value {
+            if (id != 2) return error.InvalidTag;
+            return try decoder.decodeTag(.ia5_string);
+        }
+    }.decode;
+
+    var decoder = Decoder.init(
+        testing.allocator,
+        bytes,
+        .{
+            .with_schema = &.{
+                .{
+                    .choice = callback,
+                },
+            },
+        },
+    );
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("example.com", value.ia5_string);
 }
