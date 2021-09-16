@@ -17,6 +17,7 @@ pub const Tag = enum(u8) {
     integer = 0x02,
     bit_string = 0x03,
     octet_string = 0x04,
+    @"null" = 0x05,
     object_identifier = 0x06,
     utf8_string = 0x0C,
     printable_string = 0x13,
@@ -43,6 +44,7 @@ pub const Value = union(Tag) {
     utc_time: []const u8,
     sequence: []const Value,
     set: []const Value,
+    @"null",
 
     /// Frees any memory that was allocated while constructed
     /// a given `Value`
@@ -82,6 +84,7 @@ pub const Kind = union(enum) {
     /// if the id matches the upper bits of the tag byte.
     /// When the id does not match, the element will be ignored.
     context_specific: struct {
+        optional: bool = false,
         id: u8,
         tag: Tag,
     },
@@ -178,6 +181,10 @@ pub const Decoder = struct {
                             const id = @truncate(u3, tag_byte);
                             if (id == ctx.id) {
                                 break :blk ctx.tag;
+                            } else if (ctx.optional) {
+                                self.maybeAdvanceElement();
+                                self.index -= 1;
+                                return @as(Value, .@"null");
                             }
                             return error.InvalidTag;
                         },
@@ -211,6 +218,7 @@ pub const Decoder = struct {
             },
             .object_identifier => try self.decodeObjectIdentifier(),
             .sequence, .set => try self.decodeSequence(tag),
+            .@"null" => try self.decodeNull(),
             else => unreachable,
         };
     }
@@ -365,6 +373,14 @@ pub const Decoder = struct {
             else => unreachable,
         };
     }
+
+    /// Decodes the data into a `@"null"` `Value`
+    /// and verifies the length is '0'.
+    pub fn decodeNull(self: *Decoder) !Value {
+        const length = try self.findLength();
+        if (length != 0) return error.InvalidLength;
+        return .@"null";
+    }
 };
 
 test "Decode int" {
@@ -448,4 +464,34 @@ test "Choice" {
     defer value.deinit(testing.allocator);
 
     try testing.expectEqualStrings("example.com", value.ia5_string);
+}
+
+test "Optional" {
+    const bytes: []const u8 = &.{ 0x30, 0x03, 0x80, 0x01, 0x09 };
+
+    var decoder = Decoder.init(testing.allocator, bytes, .{ .with_schema = &.{
+        .{ .tag = .sequence }, .{ .context_specific = .{ .id = 0x0, .tag = .integer } },
+    } });
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u8, 9), try value.sequence[0].integer.to(u8));
+}
+
+test "Optional with null" {
+    const bytes: []const u8 = &.{ 0x30, 0x03, 0x81, 0x01, 0x09 };
+
+    var decoder = Decoder.init(testing.allocator, bytes, .{
+        .with_schema = &.{
+            .{ .tag = .sequence },
+            .{ .context_specific = .{ .optional = true, .id = 0x0, .tag = .integer } },
+            .{ .context_specific = .{ .optional = true, .id = 0x1, .tag = .integer } },
+        },
+    });
+    const value = try decoder.decode();
+    defer value.deinit(testing.allocator);
+
+    try testing.expect(value.sequence.len == 2);
+    try testing.expect(value.sequence[0] == .@"null");
+    try testing.expectEqual(@as(u8, 9), try value.sequence[1].integer.to(u8));
 }
