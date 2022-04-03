@@ -205,7 +205,12 @@ pub fn ctr(
                 mem.writeInt(u128, counters[j * 16 .. j * 16 + 16], counterInt.*, endian);
                 counterInt.* +%= 1;
             }
-            block_cipher.xorWide(parallel_count, dst[start_idx..][cur_idx .. cur_idx + wide_block_length][0..wide_block_length], src[start_idx..][cur_idx .. cur_idx + wide_block_length][0..wide_block_length], counters);
+            block_cipher.xorWide(
+                parallel_count,
+                dst[start_idx..][cur_idx..][0..wide_block_length],
+                src[start_idx..][cur_idx..][0..wide_block_length],
+                counters,
+            );
             idx.* += wide_block_length;
         }
     }
@@ -213,7 +218,11 @@ pub fn ctr(
         var counter: [BlockCipher.block_length]u8 = undefined;
         mem.writeInt(u128, &counter, counterInt.*, endian);
         counterInt.* +%= 1;
-        block_cipher.xor(dst[start_idx..][cur_idx .. cur_idx + block_length][0..block_length], src[start_idx..][cur_idx .. cur_idx + block_length][0..block_length], counter);
+        block_cipher.xor(
+            dst[start_idx..][cur_idx..][0..block_length],
+            src[start_idx..][cur_idx..][0..block_length],
+            counter,
+        );
         idx.* += block_length;
     }
     if (cur_idx < remaining) {

@@ -5,6 +5,5 @@ test {
     _ = @import("server.zig");
     _ = @import("crypto/crypto.zig");
     _ = @import("ciphers.zig");
-    _ = @import("pem.zig");
-    _ = @import("asn1.zig");
+    _ = @import("cert/cert.zig");
 }
