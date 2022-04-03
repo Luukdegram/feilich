@@ -1,6 +1,8 @@
 //! Handles the connection between the server (this)
 //! and its peer (client). Initially, it performs a handshake,
 //! which if succesful will send all data encrypted to the client.
+const Server = @This();
+
 const std = @import("std");
 const tls = @import("tls.zig");
 const ciphers = @import("ciphers.zig");
@@ -13,319 +15,317 @@ const Sha256 = crypto.hash.sha2.Sha256;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const Curve25519 = crypto.ecc.Curve25519;
 
-/// Server is a data object, containing the
-/// private and public key for the TLS 1.3 connection.
-///
-/// This construct can then be used to connect to new clients.
-pub const Server = struct {
-    private_key: []const u8,
-    public_key: []const u8,
-    gpa: *Allocator,
+private_key: []const u8,
+public_key: []const u8,
+gpa: Allocator,
 
-    const Error = error{
-        /// We expected a certain message from the client,
-        /// but instead received a different one.
-        UnexpectedMessage,
-        /// The client does not support TLS 1.3
-        UnsupportedVersion,
-        /// When the named groups supported by the client,
-        /// or part of the given key_share are not supported by
-        /// the server.
-        UnsupportedNamedGroup,
-        /// None of the cipher suites provided by the client are
-        /// currently supported by the server.
-        UnsupportedCipherSuite,
-        /// The signate algorithms provided by the client
-        /// are not supported by the server.
-        UnsupportedSignatureAlgorithm,
-        /// The client has sent a record whose length exceeds 2^14-1 bytes
-        IllegalLength,
-        /// Client has sent an unexpected record type, or closed it with a
-        /// different record type than it was opened with.
-        UnexpectedRecordType,
-        /// Host ran out of memory
-        OutOfMemory,
-        /// Peer has closed the connection with the host.
-        EndOfStream,
-    } || crypto.errors.IdentityElementError || tls.Alert.Error;
+const Error = error{
+    /// We expected a certain message from the client,
+    /// but instead received a different one.
+    UnexpectedMessage,
+    /// The client does not support TLS 1.3
+    UnsupportedVersion,
+    /// When the named groups supported by the client,
+    /// or part of the given key_share are not supported by
+    /// the server.
+    UnsupportedNamedGroup,
+    /// None of the cipher suites provided by the client are
+    /// currently supported by the server.
+    UnsupportedCipherSuite,
+    /// The signate algorithms provided by the client
+    /// are not supported by the server.
+    UnsupportedSignatureAlgorithm,
+    /// The client has sent a record whose length exceeds 2^14-1 bytes
+    IllegalLength,
+    /// Client has sent an unexpected record type, or closed it with a
+    /// different record type than it was opened with.
+    UnexpectedRecordType,
+    /// Host ran out of memory
+    OutOfMemory,
+    /// Peer has closed the connection with the host.
+    EndOfStream,
+} || crypto.errors.IdentityElementError || tls.Alert.Error;
 
-    /// Initializes a new `Server` instance for a given public/private key pair.
-    pub fn init(gpa: *Allocator, private_key: []const u8, public_key: []const u8) Server {
-        return .{ .gpa = gpa, .private_key = private_key, .public_key = public_key };
+/// Initializes a new `Server` instance for a given public/private key pair.
+pub fn init(gpa: Allocator, private_key: []const u8, public_key: []const u8) Server {
+    return .{ .gpa = gpa, .private_key = private_key, .public_key = public_key };
+}
+
+/// Connects the server with a new client and performs its handshake.
+/// After succesfull handshake, a new reader and writer are returned which
+/// automatically decrypt, and encrypt the data before reading/writing.
+pub fn connect(
+    self: Server,
+    /// Reader 'interface' to the client's connection
+    reader: anytype,
+    /// Writer 'interface' to the client's connection
+    writer: anytype,
+) ConnectError(@TypeOf(reader), @TypeOf(writer))!void {
+    var hasher = Sha256.init(.{});
+    var handshake_reader = handshake.handshakeReader(reader, &hasher);
+    var handshake_writer = handshake.handshakeWriter(writer, &hasher);
+
+    var client_key_share: tls.KeyShare = undefined;
+    var server_key_share: tls.KeyShare = undefined;
+    var signature: tls.SignatureAlgorithm = undefined;
+    var server_exchange: tls.KeyExchange = undefined;
+    var cipher_suite: tls.CipherSuite = undefined;
+
+    const record = try tls.Record.readFrom(reader);
+    try ensureLength(record.len, writer);
+    if (record.record_type != .handshake) {
+        try writeAlert(.fatal, .unexpected_message, writer);
+        return error.UnexpectedRecordType;
     }
 
-    /// Connects the server with a new client and performs its handshake.
-    /// After succesfull handshake, a new reader and writer are returned which
-    /// automatically decrypt, and encrypt the data before reading/writing.
-    pub fn connect(
-        self: Server,
-        /// Reader 'interface' to the client's connection
-        reader: anytype,
-        /// Writer 'interface' to the client's connection
-        writer: anytype,
-    ) ConnectError(@TypeOf(reader), @TypeOf(writer))!void {
-        var hasher = Sha256.init(.{});
-        var handshake_reader = handshake.handshakeReader(reader, &hasher);
-        var handshake_writer = handshake.handshakeWriter(writer, &hasher);
+    // A client requested to connect with the server,
+    // verify a client hello message.
+    //
+    // We're using a while loop here as we may send a HelloRetryRequest
+    // in which the client will send a new helloClient.
+    // When a succesful hello reply was sent, we continue the regular path.
+    while (true) {
+        const hello_result = try handshake_reader.decode();
+        switch (hello_result) {
+            .client_hello => |client_result| {
+                cipher_suite = for (client_result.cipher_suites) |suite| {
+                    if (ciphers.isSupported(suite)) break suite;
+                } else {
+                    try writeAlert(.fatal, .handshake_failure, writer);
+                    return error.UnsupportedCipherSuite;
+                };
 
-        var client_key_share: tls.KeyShare = undefined;
-        var server_key_share: tls.KeyShare = undefined;
-        var signature: tls.SignatureAlgorithm = undefined;
-        var server_exchange: tls.KeyExchange = undefined;
-        var cipher_suite: tls.CipherSuite = undefined;
+                var version_verified = false;
+                var chosen_signature: ?tls.SignatureAlgorithm = null;
+                var chosen_group: ?tls.NamedGroup = null;
+                var key_share: ?tls.KeyShare = null;
 
-        const record = try tls.Record.readFrom(reader);
-        try ensureLength(record.len, writer);
-        if (record.record_type != .handshake) {
-            try writeAlert(.fatal, .unexpected_message, writer);
-            return error.UnexpectedRecordType;
-        }
-
-        // A client requested to connect with the server,
-        // verify a client hello message.
-        //
-        // We're using a while loop here as we may send a HelloRetryRequest
-        // in which the client will send a new helloClient.
-        // When a succesful hello reply was sent, we continue the regular path.
-        while (true) {
-            const hello_result = try handshake_reader.decode();
-            switch (hello_result) {
-                .client_hello => |client_result| {
-                    cipher_suite = for (client_result.cipher_suites) |suite| {
-                        if (ciphers.isSupported(suite)) break suite;
-                    } else {
-                        try writeAlert(.fatal, .handshake_failure, writer);
-                        return error.UnsupportedCipherSuite;
-                    };
-
-                    var version_verified = false;
-                    var chosen_signature: ?tls.SignatureAlgorithm = null;
-                    var chosen_group: ?tls.NamedGroup = null;
-                    var key_share: ?tls.KeyShare = null;
-
-                    var it = tls.Extension.Iterator.init(client_result.extensions);
-                    loop: while (true) {
-                        it_loop: while (it.next(self.gpa)) |maybe_extension| {
-                            const extension = maybe_extension orelse break :loop; // reached end of iterator so break out of outer loop
-                            switch (extension) {
-                                .supported_versions => |versions| for (versions) |version| {
-                                    // Check for TLS 1.3, when found continue
-                                    // else we return an error.
-                                    if (version == 0x0304) {
-                                        version_verified = true;
-                                        continue :it_loop;
-                                    }
-                                } else return error.UnsupportedVersion,
-                                .supported_groups => |groups| for (groups) |group| {
-                                    if (tls.supported_named_groups.isSupported(group)) {
-                                        chosen_group = group;
-                                        continue :it_loop;
-                                    }
-                                },
-                                .signature_algorithms => |algs| for (algs) |alg| {
-                                    if (tls.supported_signature_algorithms.isSupported(alg)) {
-                                        chosen_signature = alg;
-                                        continue :it_loop;
-                                    }
-                                },
-                                .key_share => |keys| {
-                                    defer self.gpa.free(keys);
-                                    for (keys) |key| {
-                                        if (tls.supported_named_groups.isSupported(key.named_group)) {
-                                            key_share = .{
-                                                .named_group = key.named_group,
-                                                .key_exchange = key.key_exchange,
-                                            };
-                                            continue :it_loop;
-                                        }
-                                    }
-                                },
-                                else => {},
-                            }
-                        } else |err| switch (err) {
-                            error.UnsupportedExtension => {
-                                // try writeAlert(.warning, .unsupported_extension, writer);
-                                // unsupported extensions are a warning, we do not need to support
-                                // them all. Simply continue the loop when we find one.
-                                continue :loop;
+                var it = tls.Extension.Iterator.init(client_result.extensions);
+                loop: while (true) {
+                    it_loop: while (it.next(self.gpa)) |maybe_extension| {
+                        const extension = maybe_extension orelse break :loop; // reached end of iterator so break out of outer loop
+                        switch (extension) {
+                            .supported_versions => |versions| for (versions) |version| {
+                                // Check for TLS 1.3, when found continue
+                                // else we return an error.
+                                if (version == 0x0304) {
+                                    version_verified = true;
+                                    continue :it_loop;
+                                }
+                            } else return error.UnsupportedVersion,
+                            .supported_groups => |groups| for (groups) |group| {
+                                if (tls.supported_named_groups.isSupported(group)) {
+                                    chosen_group = group;
+                                    continue :it_loop;
+                                }
                             },
-                            else => |e| return e,
+                            .signature_algorithms => |algs| for (algs) |alg| {
+                                if (tls.supported_signature_algorithms.isSupported(alg)) {
+                                    chosen_signature = alg;
+                                    continue :it_loop;
+                                }
+                            },
+                            .key_share => |keys| {
+                                defer self.gpa.free(keys);
+                                for (keys) |key| {
+                                    if (tls.supported_named_groups.isSupported(key.named_group)) {
+                                        key_share = .{
+                                            .named_group = key.named_group,
+                                            .key_exchange = key.key_exchange,
+                                        };
+                                        continue :it_loop;
+                                    }
+                                }
+                            },
+                            else => {},
                         }
+                    } else |err| switch (err) {
+                        error.UnsupportedExtension => {
+                            // try writeAlert(.warning, .unsupported_extension, writer);
+                            // unsupported extensions are a warning, we do not need to support
+                            // them all. Simply continue the loop when we find one.
+                            continue :loop;
+                        },
+                        else => |e| return e,
                     }
+                }
 
-                    if (!version_verified) {
-                        try writeAlert(.fatal, .protocol_version, writer);
-                        return error.UnsupportedVersion;
-                    }
+                if (!version_verified) {
+                    try writeAlert(.fatal, .protocol_version, writer);
+                    return error.UnsupportedVersion;
+                }
 
-                    client_key_share = key_share orelse {
+                client_key_share = key_share orelse {
+                    try writeAlert(.fatal, .handshake_failure, writer);
+                    return error.UnsupportedNamedGroup;
+                };
+
+                signature = chosen_signature orelse {
+                    try writeAlert(.fatal, .handshake_failure, writer);
+                    return error.UnsupportedSignatureAlgorithm;
+                };
+
+                server_key_share = blk: {
+                    const group = chosen_group orelse {
                         try writeAlert(.fatal, .handshake_failure, writer);
                         return error.UnsupportedNamedGroup;
                     };
 
-                    signature = chosen_signature orelse {
-                        try writeAlert(.fatal, .handshake_failure, writer);
-                        return error.UnsupportedSignatureAlgorithm;
+                    server_exchange = try tls.KeyExchange.fromCurve(tls.curves.x25519);
+                    break :blk tls.KeyShare{
+                        .named_group = group,
+                        .key_exchange = server_exchange.public_key,
                     };
+                };
 
-                    server_key_share = blk: {
-                        const group = chosen_group orelse {
-                            try writeAlert(.fatal, .handshake_failure, writer);
-                            return error.UnsupportedNamedGroup;
-                        };
+                const random_seed = blk: {
+                    // we do not provide TLS downgrading and therefore do not have to set the
+                    // last 8 bytes to specific values as noted in section 4.1.3
+                    // https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
+                    var seed: [32]u8 = undefined;
+                    std.crypto.random.bytes(&seed);
+                    break :blk seed;
+                };
 
-                        server_exchange = try tls.KeyExchange.fromCurve(tls.curves.x25519);
-                        break :blk tls.KeyShare{
-                            .named_group = group,
-                            .key_exchange = server_exchange.public_key,
-                        };
-                    };
+                // hash and write the server hello
+                try handshake_writer.serverHello(
+                    .server_hello,
+                    client_result.session_id,
+                    cipher_suite,
+                    server_key_share,
+                    random_seed,
+                );
 
-                    const random_seed = blk: {
-                        // we do not provide TLS downgrading and therefore do not have to set the
-                        // last 8 bytes to specific values as noted in section 4.1.3
-                        // https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
-                        var seed: [32]u8 = undefined;
-                        std.crypto.random.bytes(&seed);
-                        break :blk seed;
-                    };
+                try writer.writeAll(&.{
+                    0x14, 0x03, 0x03, 0x00, 0x01, 0x01,
+                });
 
-                    // hash and write the server hello
-                    try handshake_writer.serverHello(
-                        .server_hello,
-                        client_result.session_id,
-                        cipher_suite,
-                        server_key_share,
-                        random_seed,
-                    );
-
-                    // We sent our hello server, meaning we can continue
-                    // the regular path.
-                    break;
-                },
-                // else => return error.UnexpectedMessage,
-            }
-        }
-
-        // generate handshake key, which is constructed by multiplying
-        // the client's public key with the server's private key using the negotiated
-        // named group.
-        const curve = std.crypto.ecc.Curve25519.fromBytes(client_key_share.key_exchange);
-        const shared_key = try curve.clampedMul(server_exchange.private_key);
-
-        // Calculate the handshake keys
-        // Since we do not yet support PSK resumation,
-        // we first build an early secret which we use to
-        // expand our keys later on.
-        var empty_hash: [32]u8 = undefined;
-        const early_secret = HkdfSha256.extract("", &[_]u8{0} ** 32);
-        Sha256.hash("", &empty_hash, .{});
-        const derived_secret = tls.hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
-        const handshake_secret = HkdfSha256.extract(&derived_secret, &shared_key.toBytes());
-
-        const current_hash: [32]u8 = blk: {
-            var temp_hasher = hasher;
-            var buf: [32]u8 = undefined;
-            temp_hasher.final(&buf);
-            break :blk buf;
-        };
-
-        // secrets to generate our keys
-        const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
-        const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
-
-        var key_storage: ciphers.KeyStorage = .{};
-        inline for (ciphers.supported) |cipher| {
-            if (cipher.suite == cipher_suite) {
-                // keys used to encrypt and decrypt client/server data.
-                const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", cipher.key_length);
-                const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", cipher.key_length);
-
-                // nonces for data decryption/encryption from/to client/server.
-                const client_handshake_iv = tls.hkdfExpandLabel(client_secret, "iv", "", cipher.nonce_length);
-                const server_handshake_iv = tls.hkdfExpandLabel(server_secret, "iv", "", cipher.nonce_length);
-
-                key_storage.setServerKey(cipher, server_handshake_key);
-                key_storage.setClientKey(cipher, client_handshake_key);
-                key_storage.setServerIv(cipher, server_handshake_iv);
-                key_storage.setClientIv(cipher, client_handshake_iv);
-
-                // -- Write the encrypted message that wraps multiple handshake headers -- //
-                try handshake_writer.handshakeFinish(cipher, &key_storage, self.public_key, server_secret, 0);
-            }
-        }
-
-        // The encryption read -and writer that we will return back to
-        // the user at the end of the handshake.
-        var encryption_readwriter = encryption.encryptedReadWriter(
-            reader,
-            writer,
-            cipher_suite,
-            key_storage,
-        );
-        const decryption_reader = encryption_readwriter.reader();
-        const encryption_writer = encryption_readwriter.writer();
-
-        // -- Expect client response with encrypted data --//
-        var decrypted_data: [1 << 14]u8 = undefined;
-        var read_len = try decryption_reader.read(&decrypted_data);
-        while (encryption_readwriter.reader_state == .reading) {
-            read_len += try decryption_reader.read(decrypted_data[read_len..]);
-        } else if (read_len == 0) return error.EndOfStream;
-
-        const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..4].*);
-        if (hs_msg.handshake_type != .finished) {
-            const alert = tls.Alert.init(.unexpected_message, .fatal);
-            try alert.writeTo(encryption_writer);
-            return error.UnexpectedMessage;
-        }
-        const finished_key = tls.hkdfExpandLabel(client_secret, "finished", "", 32);
-        const finished_hash = blk: {
-            var tmp_hash = hasher;
-            var buf: [32]u8 = undefined;
-            tmp_hash.final(&buf);
-            break :blk buf;
-        };
-
-        var verify_data: [32]u8 = undefined;
-        crypto.auth.hmac.sha2.HmacSha256.create(&verify_data, &finished_key, &finished_hash);
-        if (!std.mem.eql(u8, &verify_data, decrypted_data[4..][0..32])) {
-            const alert = tls.Alert.init(.decrypt_error, .fatal);
-            try alert.writeTo(encryption_writer);
-            return error.UnexpectedMessage;
-        }
-
-        var ping: [4]u8 = undefined;
-        try decryption_reader.readNoEof(&ping);
-        std.debug.print("Ping: {s}\n", .{&ping});
-        if (!std.mem.eql(u8, &ping, "ping")) {
-            const alert = tls.Alert.init(.decrypt_error, .fatal);
-            try alert.writeTo(encryption_writer);
-            return error.UnexpectedMessage;
+                // We sent our hello server, meaning we can continue
+                // the regular path.
+                break;
+            },
+            // else => return error.UnexpectedMessage,
         }
     }
 
-    /// Constructs an alert record and writes it to the client's connection.
-    /// When an alert is fatal, it is illegal to write any more data to the `writer`
-    /// as the connection will be closed by both server and client.
-    fn writeAlert(severity: tls.Alert.Severity, tag: tls.Alert.Tag, writer: anytype) @TypeOf(writer).Error!void {
-        const record = tls.Record.init(.alert, 2); // 2 bytes for level and description.
-        try record.writeTo(writer);
-        try writer.writeAll(&.{ severity.int(), tag.int() });
-        switch (severity) {
-            .warning => std.log.warn("{s}", .{@tagName(tag)}),
-            .fatal => std.log.err("{s}", .{@tagName(tag)}),
+    // generate handshake key, which is constructed by multiplying
+    // the client's public key with the server's private key using the negotiated
+    // named group.
+    const curve = std.crypto.ecc.Curve25519.fromBytes(client_key_share.key_exchange);
+    const shared_key = try curve.clampedMul(server_exchange.private_key);
+
+    // Calculate the handshake keys
+    // Since we do not yet support PSK resumation,
+    // we first build an early secret which we use to
+    // expand our keys later on.
+    var empty_hash: [32]u8 = undefined;
+    const early_secret = HkdfSha256.extract("", &[_]u8{0} ** 32);
+    Sha256.hash("", &empty_hash, .{});
+    const derived_secret = tls.hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
+    const handshake_secret = HkdfSha256.extract(&derived_secret, &shared_key.toBytes());
+
+    const current_hash: [32]u8 = blk: {
+        var temp_hasher = hasher;
+        var buf: [32]u8 = undefined;
+        temp_hasher.final(&buf);
+        break :blk buf;
+    };
+
+    // secrets to generate our keys
+    const client_secret = tls.hkdfExpandLabel(handshake_secret, "c hs traffic", &current_hash, 32);
+    const server_secret = tls.hkdfExpandLabel(handshake_secret, "s hs traffic", &current_hash, 32);
+
+    var key_storage: ciphers.KeyStorage = .{};
+    inline for (ciphers.supported) |cipher| {
+        if (cipher.suite == cipher_suite) {
+            // keys used to encrypt and decrypt client/server data.
+            const client_handshake_key = tls.hkdfExpandLabel(client_secret, "key", "", cipher.key_length);
+            const server_handshake_key = tls.hkdfExpandLabel(server_secret, "key", "", cipher.key_length);
+
+            // nonces for data decryption/encryption from/to client/server.
+            const client_handshake_iv = tls.hkdfExpandLabel(client_secret, "iv", "", cipher.nonce_length);
+            const server_handshake_iv = tls.hkdfExpandLabel(server_secret, "iv", "", cipher.nonce_length);
+
+            key_storage.setServerKey(cipher, server_handshake_key);
+            key_storage.setClientKey(cipher, client_handshake_key);
+            key_storage.setServerIv(cipher, server_handshake_iv);
+            key_storage.setClientIv(cipher, client_handshake_iv);
+
+            // -- Write the encrypted message that wraps multiple handshake headers -- //
+            try handshake_writer.handshakeFinish(cipher, &key_storage, self.public_key, server_secret, 0);
         }
     }
 
-    /// Tests if given `length` surpasses the max record length of 2^14
-    fn ensureLength(length: usize, writer: anytype) (@TypeOf(writer).Error || error{IllegalLength})!void {
-        if (length > 1 << 14) {
-            try writeAlert(.fatal, .record_overflow, writer);
-            return error.IllegalLength;
-        }
+    // The encryption read -and writer that we will return back to
+    // the user at the end of the handshake.
+    var encryption_readwriter = encryption.encryptedReadWriter(
+        reader,
+        writer,
+        cipher_suite,
+        key_storage,
+    );
+    const decryption_reader = encryption_readwriter.reader();
+    const encryption_writer = encryption_readwriter.writer();
+
+    // -- Expect client response with encrypted data --//
+    var decrypted_data: [1 << 14]u8 = undefined;
+    var read_len = try decryption_reader.read(&decrypted_data);
+    while (encryption_readwriter.reader_state == .reading) {
+        read_len += try decryption_reader.read(decrypted_data[read_len..]);
+    } else if (read_len == 0) return error.EndOfStream;
+
+    const hs_msg = handshake.HandshakeHeader.fromBytes(decrypted_data[0..4].*);
+    if (hs_msg.handshake_type != .finished) {
+        const alert = tls.Alert.init(.unexpected_message, .fatal);
+        try alert.writeTo(encryption_writer);
+        return error.UnexpectedMessage;
     }
-};
+    const finished_key = tls.hkdfExpandLabel(client_secret, "finished", "", 32);
+    const finished_hash = blk: {
+        var tmp_hash = hasher;
+        var buf: [32]u8 = undefined;
+        tmp_hash.final(&buf);
+        break :blk buf;
+    };
+
+    var verify_data: [32]u8 = undefined;
+    crypto.auth.hmac.sha2.HmacSha256.create(&verify_data, &finished_key, &finished_hash);
+    if (!std.mem.eql(u8, &verify_data, decrypted_data[4..][0..32])) {
+        const alert = tls.Alert.init(.decrypt_error, .fatal);
+        try alert.writeTo(encryption_writer);
+        return error.UnexpectedMessage;
+    }
+
+    var ping: [4]u8 = undefined;
+    try decryption_reader.readNoEof(&ping);
+    std.debug.print("Ping: {s}\n", .{&ping});
+    if (!std.mem.eql(u8, &ping, "ping")) {
+        const alert = tls.Alert.init(.decrypt_error, .fatal);
+        try alert.writeTo(encryption_writer);
+        return error.UnexpectedMessage;
+    }
+}
+
+/// Constructs an alert record and writes it to the client's connection.
+/// When an alert is fatal, it is illegal to write any more data to the `writer`
+/// as the connection will be closed by both server and client.
+fn writeAlert(severity: tls.Alert.Severity, tag: tls.Alert.Tag, writer: anytype) @TypeOf(writer).Error!void {
+    const record = tls.Record.init(.alert, 2); // 2 bytes for level and description.
+    try record.writeTo(writer);
+    try writer.writeAll(&.{ severity.int(), tag.int() });
+    switch (severity) {
+        .warning => std.log.warn("{s}", .{@tagName(tag)}),
+        .fatal => std.log.err("{s}", .{@tagName(tag)}),
+    }
+}
+
+/// Tests if given `length` surpasses the max record length of 2^14
+fn ensureLength(length: usize, writer: anytype) (@TypeOf(writer).Error || error{IllegalLength})!void {
+    if (length > 1 << 14) {
+        try writeAlert(.fatal, .record_overflow, writer);
+        return error.IllegalLength;
+    }
+}
 
 // --- logical tests --- //
 

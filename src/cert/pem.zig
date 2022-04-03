@@ -13,7 +13,7 @@ pub const Pem = struct {
 
     /// Frees any memory that was allocated during Pem decoding.
     /// Must provide the same `Allocator` that was given to the decoder.
-    pub fn deinit(self: *Pem, gpa: *Allocator) void {
+    pub fn deinit(self: *Pem, gpa: Allocator) void {
         gpa.free(self.content);
         self.* = undefined;
     }
@@ -71,7 +71,7 @@ pub const DecodeError = error{
 /// Decodes given bytes into a `Pem` instance.
 /// Memory is owned by caller and can be freed upon calling `deinit` on
 /// the returned instance.
-pub fn decode(gpa: *Allocator, data: []const u8) (DecodeError || std.base64.Error)!Pem {
+pub fn decode(gpa: Allocator, data: []const u8) (DecodeError || std.base64.Error)!Pem {
     var maybe_asn_type: ?AsnType = null;
     const begin_offset = if (mem.indexOf(u8, data, "-----BEGIN ")) |offset| blk: {
         const end_offset = mem.indexOfPos(u8, data, offset + 11, "-----") orelse return error.InvalidBegin;
@@ -106,7 +106,7 @@ pub fn decode(gpa: *Allocator, data: []const u8) (DecodeError || std.base64.Erro
 
 /// Given a file path, will attempt to decode its content into a `Pem` instance.
 /// Memory is owned by the caller.
-pub fn fromFile(gpa: *Allocator, file_path: []const u8) (DecodeError || std.base64.Error)!Pem {
+pub fn fromFile(gpa: Allocator, file_path: []const u8) (DecodeError || std.base64.Error)!Pem {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 

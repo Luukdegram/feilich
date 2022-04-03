@@ -48,7 +48,7 @@ pub const Value = union(Tag) {
 
     /// Frees any memory that was allocated while constructed
     /// a given `Value`
-    pub fn deinit(self: Value, gpa: *Allocator) void {
+    pub fn deinit(self: Value, gpa: Allocator) void {
         switch (self) {
             .integer => |int| gpa.free(int.limbs),
             .sequence => |seq| for (seq) |val| {
@@ -111,7 +111,7 @@ pub const Decoder = struct {
     /// Allocator is used to allocate memory for limbs (as we must swap them due to endianness),
     /// as well as allocate a Value for sets and sequences.
     /// Memory can be freed easily by calling `deinit` on a `Value`.
-    gpa: *Allocator,
+    gpa: Allocator,
     /// A `Schema` is used to provide a list of ordered elements that tell
     /// the decoder how to decode each individual element, allowing the decoder
     /// to handle context-specific elements.
@@ -145,7 +145,7 @@ pub const Decoder = struct {
     /// layout of the encoded data and tells the decoder how it must be decoded.
     ///
     /// Provide `.no_schema` when the data is 'simple' and requires no context-specific handling.
-    pub fn init(gpa: *Allocator, data: []const u8, options: DecodeOptions) Decoder {
+    pub fn init(gpa: Allocator, data: []const u8, options: DecodeOptions) Decoder {
         return .{
             .index = 0,
             .data = data,

@@ -6,7 +6,7 @@ const crypto = std.crypto;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 
 /// Target cpu's endianness. Use this to check if byte swapping is required.
-const target_endianness = std.builtin.target.cpu.arch.endian();
+const target_endianness = @import("builtin").cpu.arch.endian();
 
 /// Record header. TLS sessions are broken into the sending
 /// and receiving of records, which are blocks of data with a type,
@@ -465,7 +465,7 @@ pub const Extension = union(Tag) {
         /// Parses the next extension, returning `null` when all extensions have been parsed.
         /// Will return `UnsupportedExtension` when an extension is not supported by TLS 1.3,
         /// or simply isn't implemented yet.
-        pub fn next(self: *Iterator, gpa: *Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
+        pub fn next(self: *Iterator, gpa: Allocator) error{ OutOfMemory, UnsupportedExtension }!?Extension {
             if (self.index >= self.data.len) return null;
 
             const tag_byte = mem.readIntBig(u16, self.data[self.index..][0..2]);
@@ -561,7 +561,7 @@ test "Extension iterator" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    while (try it.next(&arena.allocator)) |ext| {
+    while (try it.next(arena.allocator())) |ext| {
         switch (ext) {
             .server_name => |name| try std.testing.expectEqualStrings("example.ulfheim.net", name),
             .supported_groups => |groups| try std.testing.expectEqualSlices(
