@@ -13,6 +13,13 @@ libraries not offering full support for it yet, I do very much want to implement
 TLS 1.2 is not a goal as we already have a great TLS 1.2 library for zig called [iguanaTLS](https://github.com/alexnask/igunaTLS).
 Although it currently only supports client side, we could perhaps PR server support in the future.
 
+## Project status
+
+The project is currently on-hold until I have more free time to work on this besides the self-hosted compiler for the Zig programming language.
+I'd like to bring this project to the point where it's fully operational for a single cipher suite. From there on, it should be fairly straight
+forward to implement more suites as well as other crypto algorithms supported by TLS 1.3.
+I expect to be able to continue and get it to that state Q3/Q4 of this year. Until then, this project will be stale.
+
 ## Should I use this?
 
 Maybe? I have no prior experience with TLS, nor am I some crypto expert. TLS contains some known [implementation pitfalls](https://datatracker.ietf.org/doc/html/rfc8446#appendix-C.3),
