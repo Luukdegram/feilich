@@ -346,7 +346,7 @@ pub fn bytesToTypedSlice(comptime T: type, bytes: anytype) []const T {
     if (target_endianness == .Little) for (slice) |*element| {
         element.* = @byteSwap(IntType, element.*);
     };
-    return @bitCast([]const T, slice);
+    return @ptrCast([]const T, slice);
 }
 
 /// Keyshare represents the key exchange used to generate
@@ -477,7 +477,7 @@ pub const Extension = union(Tag) {
 
             switch (@intToEnum(Extension.Tag, tag_byte)) {
                 .supported_versions => return Extension{ .supported_versions = bytesToTypedSlice(u16, extension_data[1..]) },
-                .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = @bitCast(
+                .psk_key_exchange_modes => return Extension{ .psk_key_exchange_modes = @ptrCast(
                     []const PskKeyExchangeMode,
                     extension_data[1..],
                 ) },
@@ -609,7 +609,7 @@ pub const KeyExchange = struct {
 pub const Curve = struct {
     /// Error which can occur when generating the public key
     pub const Error = crypto.errors.IdentityElementError;
-    genFn: fn (*Curve, [32]u8, *[32]u8) Error!void,
+    genFn: *const fn (*Curve, [32]u8, *[32]u8) Error!void,
 
     /// Generates a new public key from a given private key.
     /// Writes the output of the curve function to `public_key_out`.
@@ -622,7 +622,7 @@ pub const Curve = struct {
 /// to generate keys.
 pub const curves = struct {
     const _x25519 = struct {
-        var state = Curve{ .genFn = gen };
+        var state = Curve{ .genFn = &gen };
 
         fn gen(curve: *Curve, private_key: [32]u8, public_key_out: *[32]u8) !void {
             _ = curve;

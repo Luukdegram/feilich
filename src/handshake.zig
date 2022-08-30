@@ -579,7 +579,8 @@ test "Client Hello" {
     };
     // zig fmt: on
 
-    var fb_reader = std.io.fixedBufferStream(&data).reader();
+    var fbs = std.io.fixedBufferStream(&data);
+    var fb_reader = fbs.reader();
     var hasher = Sha256.init(.{});
     var hs_reader = handshakeReader(fb_reader, &hasher);
     const result = try hs_reader.decode();
