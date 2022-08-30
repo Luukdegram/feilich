@@ -89,7 +89,7 @@ pub const Kind = union(enum) {
         tag: Tag,
     },
     /// Allows the user how to decode the choice
-    choice: fn (decoder: *Decoder, id: u8) Decoder.Error!Value,
+    choice: *const fn (decoder: *Decoder, id: u8) Decoder.Error!Value,
     /// When the element can be ignored
     none,
 };
@@ -191,7 +191,7 @@ pub const Decoder = struct {
                         .choice => |callback| {
                             // decrease index to make the tag byte available again to the callback
                             self.index -= 1;
-                            return callback(self, @truncate(u3, tag_byte));
+                            return callback.*(self, @truncate(u3, tag_byte));
                         },
                         else => return error.InvalidTag,
                     }
@@ -455,7 +455,7 @@ test "Choice" {
         .{
             .with_schema = &.{
                 .{
-                    .choice = callback,
+                    .choice = &callback,
                 },
             },
         },
