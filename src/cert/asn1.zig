@@ -191,7 +191,7 @@ pub const Decoder = struct {
                         .choice => |callback| {
                             // decrease index to make the tag byte available again to the callback
                             self.index -= 1;
-                            return callback.*(self, @truncate(u3, tag_byte));
+                            return callback(self, @truncate(u3, tag_byte));
                         },
                         else => return error.InvalidTag,
                     }

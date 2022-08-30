@@ -614,7 +614,7 @@ pub const Curve = struct {
     /// Generates a new public key from a given private key.
     /// Writes the output of the curve function to `public_key_out`.
     pub fn generateKey(self: *Curve, private_key: [32]u8, public_key_out: *[32]u8) Error!void {
-        try self.genFn.*(self, private_key, public_key_out);
+        try self.genFn(self, private_key, public_key_out);
     }
 };
 
